@@ -1,0 +1,98 @@
+# =========================
+# Build / CMake
+# =========================
+build/
+build_*/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+compile_commands.json
+Makefile
+*.cmake
+
+# =========================
+# Binaries / Objects
+# =========================
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+
+# =========================
+# CUDA
+# =========================
+*.cubin
+*.ptx
+
+# =========================
+# Python
+# =========================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# pytest cache
+.pytest_cache/
+
+# =========================
+# Virtual Environments
+# =========================
+.venv/
+venv/
+env/
+
+# =========================
+# IDE / Editor
+# =========================
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# =========================
+# macOS
+# =========================
+.DS_Store
+
+# =========================
+# Env files (IMPORTANT)
+# =========================
+.env
+
+# =========================
+# Logs
+# =========================
+*.log
+
+# =========================
+# Nsight profiling outputs
+# =========================
+profiles/*.ncu-rep
+profiles/*.nsys-rep
+profiles/*.qdrep
+profiles/*.sqlite
+
+# =========================
+# Example training outputs
+# =========================
+examples/results/*
+!examples/results/.gitkeep
+data/
+
+# =========================
+# Misc
+# =========================
+coverage/
+pip-build-tracker-*/
+pip-ephem-wheel-cache-*/
+pip-install-*/
+pytest-of-*/
+tmp*/

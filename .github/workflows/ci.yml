@@ -1,0 +1,244 @@
+# Orthon CPU CI.
+#
+# Scope note, stated up front because it is the most important thing about this
+# file: THERE IS NO CUDA JOB HERE, and that is deliberate. GitHub-hosted runners
+# have no NVIDIA GPU, so a "CUDA" job on them could only compile CPU sources, or
+# build CUDA code it can never execute. Either would report green while proving
+# nothing. CUDA is validated OFF this runner instead: single-GPU work on a
+# local RTX 4070 Laptop machine (full CUDA Python suite, CUDA native build,
+# CUDA native CTest), and the multi-GPU stack - cuda:0/cuda:1 placement, peer
+# copies, cross-GPU autograd, NCCL, and 2-rank blocking/bucketed/overlap DDP -
+# on a machine with two NVIDIA A100-SXM4-80GB GPUs. What that run covers, and
+# what it does not, is set out in docs/testing.md.
+#
+# Everything below runs the same CMake presets and commands a developer runs
+# locally - there is no CI-only build system.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Native C++ suite. No Python involved: the cpp-cpu-release preset pins
+  # BUILD_PYTHON_BINDINGS=OFF, so this job proves the C++ library and its
+  # GoogleTest suite stand on their own.
+  # --------------------------------------------------------------------------
+  cpp:
+    name: C++ tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      # v7.0.1 - pinned to an immutable commit; a tag can be repointed upstream.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Install Ninja (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+
+      # The presets pin the Ninja generator, which needs cl.exe on PATH. This is
+      # the CI equivalent of the vcvars64.bat call a Windows developer makes
+      # before building locally - it sets up the toolchain, it does not change
+      # the build system.
+      - name: Set up MSVC toolchain (Windows)
+        if: runner.os == 'Windows'
+        # v1.13.0
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
+
+      # Resolves GoogleTest: a compatible installed copy is preferred, otherwise
+      # the pinned commit is fetched (see ORTHON_GTEST_COMMIT in
+      # CMakeLists.txt). Configuration FAILS rather than registering zero tests.
+      - name: Configure
+        run: cmake --preset cpp-cpu-release
+
+      - name: Build
+        run: cmake --build --preset cpp-cpu-release
+
+      # Visibility only - the real guard is the preset's noTestsAction: error,
+      # applied by the run step below. Printed so a shrinking suite is obvious
+      # in the log rather than something you have to go looking for.
+      - name: List discovered tests
+        run: ctest --preset cpp-cpu-release -N
+
+      # No `|| true`, no `continue-on-error`: a failing test, a crashed binary
+      # or an empty suite all fail the job. `noTestsAction: error` in the test
+      # preset is what turns CTest's "No tests were found!!!" - which otherwise
+      # exits 0 - into a hard failure.
+      - name: Run CTest
+        run: ctest --preset cpp-cpu-release
+
+  # --------------------------------------------------------------------------
+  # Python suite on the supported version boundary: 3.10 is the declared
+  # minimum (pyproject requires-python), 3.13 is the current validated end.
+  # --------------------------------------------------------------------------
+  python:
+    name: Python tests (CPU, ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.13"]
+
+    steps:
+      # v7.0.1 - pinned to an immutable commit; a tag can be repointed upstream.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      # v7.0.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+          python -m pip install --upgrade pip
+
+      # The CPU wheel index, not PyPI. torch is a REFERENCE library for the
+      # parity tests; pulling the default PyPI wheel would download a CUDA
+      # runtime this job can never use, and would invite the pretence that a
+      # GPU-less runner validates CUDA. It does not.
+      - name: Install CPU-only PyTorch (test reference)
+        run: python -m pip install "torch>=2.0" --index-url https://download.pytorch.org/whl/cpu
+
+      # WITH_CUDA/WITH_NCCL are forced OFF rather than left on AUTO so the job
+      # cannot silently change meaning if a runner image ever ships a CUDA
+      # toolkit. SKBUILD_CMAKE_DEFINE is scikit-build-core's documented
+      # pass-through to CMake -D flags.
+      - name: Install orthon (CPU) with test extras
+        env:
+          SKBUILD_CMAKE_DEFINE: WITH_CUDA=OFF;WITH_NCCL=OFF
+        run: python -m pip install ".[test]"
+
+      # Fails loudly if the extension did not build or the package cannot load,
+      # before pytest gets a chance to report it as a collection error.
+      - name: Verify the extension imports and is CPU-only
+        run: |
+          python -c "import orthon; print(orthon.__file__)"
+          python -c "import orthon, sys; sys.exit(0 if not orthon.cuda_enabled() else 'expected a CPU-only build')"
+
+      # testpaths comes from pyproject ([tool.pytest.ini_options]).
+      # No pass count is hard-coded here: the workflow asserts "zero failures",
+      # and the expected totals live in docs/testing.md where they can be
+      # updated deliberately.
+      - name: Run the Python suite
+        run: python -m pytest -q
+
+  # --------------------------------------------------------------------------
+  # Packaging. Pins the contract that a normal install needs only the declared
+  # runtime dependencies - in particular NOT torch.
+  # --------------------------------------------------------------------------
+  package:
+    name: Package build + clean-install smoke
+    runs-on: ubuntu-latest
+
+    steps:
+      # v7.0.1 - pinned to an immutable commit; a tag can be repointed upstream.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      # v7.0.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.12"
+
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+          python -m pip install --upgrade pip build
+
+      - name: Build sdist and wheel
+        env:
+          SKBUILD_CMAKE_DEFINE: WITH_CUDA=OFF;WITH_NCCL=OFF
+        run: python -m build --outdir dist
+
+      - name: Show artifacts
+        run: ls -l dist
+
+      # Asserted on the artifacts rather than on pyproject.toml, because the
+      # artifact is what gets published. The wheel must ship the runtime
+      # package and nothing else beside it.
+      - name: Assert the artifacts are named and laid out as orthon
+        run: |
+          python - <<'PY'
+          import glob, sys, zipfile
+          wheels, sdists = glob.glob("dist/*.whl"), glob.glob("dist/*.tar.gz")
+          if len(wheels) != 1 or len(sdists) != 1:
+              sys.exit(f"expected one wheel and one sdist, found {wheels} {sdists}")
+          for path in wheels + sdists:
+              name = path.rsplit("/", 1)[-1]
+              if not name.startswith("orthon-0."):
+                  sys.exit(f"{name} is not an orthon distribution")
+          names = zipfile.ZipFile(wheels[0]).namelist()
+          if not any(n.startswith("orthon/") for n in names):
+              sys.exit("wheel has no orthon/ package directory")
+          tops = {n.split("/")[0] for n in names if "/" in n}
+          extra = {t for t in tops if t != "orthon" and not t.endswith(".dist-info")}
+          if extra:
+              sys.exit(f"wheel ships unexpected top-level entries: {sorted(extra)}")
+          print(f"{wheels[0]} and {sdists[0]}: orthon only")
+          PY
+
+      # A wheel build must never pull in a C++ test framework. CMakeLists.txt
+      # forces BUILD_TESTING=OFF when SKBUILD is set; this asserts the outcome
+      # rather than trusting the intent.
+      - name: Assert the wheel carries no test artifacts
+        run: |
+          python - <<'PY'
+          import glob, sys, zipfile
+          wheels = glob.glob("dist/*.whl")
+          if len(wheels) != 1:
+              sys.exit(f"expected exactly one wheel, found {wheels}")
+          names = zipfile.ZipFile(wheels[0]).namelist()
+          bad = [n for n in names if "gtest" in n.lower() or "googletest" in n.lower()
+                 or n.startswith("test_") or "/test_" in n]
+          if bad:
+              sys.exit(f"wheel contains test/GoogleTest artifacts: {bad}")
+          print(f"{wheels[0]}: {len(names)} entries, no test artifacts")
+          PY
+
+      - name: Install the wheel into a clean environment
+        run: |
+          python -m venv /tmp/smoke-env
+          /tmp/smoke-env/bin/python -m pip install --upgrade pip
+          /tmp/smoke-env/bin/python -m pip install dist/*.whl
+
+      # Proves the claim rather than assuming it: torch must be absent from an
+      # environment that only installed the wheel.
+      - name: Assert torch is not a runtime dependency
+        run: |
+          /tmp/smoke-env/bin/python - <<'PY'
+          import importlib.util, sys
+          if importlib.util.find_spec("torch") is not None:
+              sys.exit("torch was installed by the wheel's runtime dependencies")
+          print("torch absent, as required")
+          PY
+
+      # Same script a developer runs locally; see tests/smoke/package_smoke.py.
+      - name: Runtime smoke (no torch, no pytest)
+        run: /tmp/smoke-env/bin/python tests/smoke/package_smoke.py
+
+      - name: Install from the sdist as well
+        run: |
+          python -m venv /tmp/sdist-env
+          /tmp/sdist-env/bin/python -m pip install --upgrade pip
+          /tmp/sdist-env/bin/python -m pip install dist/*.tar.gz
+          /tmp/sdist-env/bin/python tests/smoke/package_smoke.py
+        env:
+          SKBUILD_CMAKE_DEFINE: WITH_CUDA=OFF;WITH_NCCL=OFF

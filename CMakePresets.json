@@ -1,0 +1,121 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "cpu-release",
+      "displayName": "CPU Release",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/cpu-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "WITH_CUDA": "OFF",
+        "WITH_NCCL": "OFF",
+        "BUILD_TESTING": "OFF"
+      }
+    },
+    {
+      "name": "avx2-release",
+      "displayName": "CPU Release With AVX2",
+      "inherits": "cpu-release",
+      "binaryDir": "${sourceDir}/build/avx2-release",
+      "cacheVariables": {
+        "WITH_AVX2": "ON"
+      }
+    },
+    {
+      "name": "cuda-release",
+      "displayName": "CUDA Release",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/cuda-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "WITH_CUDA": "ON",
+        "WITH_NCCL": "OFF",
+        "BUILD_TESTING": "OFF"
+      }
+    },
+    {
+      "name": "cuda-nccl-release",
+      "displayName": "CUDA + NCCL Release",
+      "inherits": "cuda-release",
+      "binaryDir": "${sourceDir}/build/cuda-nccl-release",
+      "cacheVariables": {
+        "WITH_NCCL": "ON"
+      }
+    },
+    {
+      "name": "cpp-cpu-release",
+      "displayName": "Native C++ Tests, CPU",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/cpp-cpu-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "WITH_CUDA": "OFF",
+        "WITH_NCCL": "OFF",
+        "BUILD_TESTING": "ON",
+        "BUILD_PYTHON_BINDINGS": "OFF"
+      }
+    },
+    {
+      "name": "cpp-cuda-release",
+      "displayName": "Native C++ Tests, CUDA",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/cpp-cuda-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "WITH_CUDA": "ON",
+        "WITH_NCCL": "OFF",
+        "BUILD_TESTING": "ON",
+        "BUILD_PYTHON_BINDINGS": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "cpu-release",
+      "configurePreset": "cpu-release"
+    },
+    {
+      "name": "avx2-release",
+      "configurePreset": "avx2-release"
+    },
+    {
+      "name": "cuda-release",
+      "configurePreset": "cuda-release"
+    },
+    {
+      "name": "cuda-nccl-release",
+      "configurePreset": "cuda-nccl-release"
+    },
+    {
+      "name": "cpp-cpu-release",
+      "configurePreset": "cpp-cpu-release"
+    },
+    {
+      "name": "cpp-cuda-release",
+      "configurePreset": "cpp-cuda-release"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "cpp-cpu-release",
+      "configurePreset": "cpp-cpu-release",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error"
+      }
+    },
+    {
+      "name": "cpp-cuda-release",
+      "configurePreset": "cpp-cuda-release",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error"
+      }
+    }
+  ]
+}

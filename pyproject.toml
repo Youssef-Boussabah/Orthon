@@ -1,0 +1,58 @@
+[build-system]
+requires = ["scikit-build-core>=0.9", "pybind11>=3.0"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "orthon"
+version = "0.1.0"
+description = "Orthon: a compact C++17/CUDA tensor and autograd runtime"
+readme = "README.md"
+# 3.10 is a hard floor, not a preference: python/orthon/nn/dropout.py uses a
+# PEP 604 annotation (`seed: int | None`) that is evaluated at import time, and
+# Dropout is reached by `import orthon`, so 3.8 and 3.9 fail with TypeError.
+requires-python = ">=3.10"
+
+# Runtime dependencies: everything needed for `import orthon` to succeed.
+# NumPy is required two ways, not one:
+#   - Python level: nn/embedding.py imports it unconditionally, and nn/__init__
+#     is imported by orthon/__init__, so a bare `import orthon` needs it.
+#     distributed/local_backend.py also imports it, but that module is reached
+#     only through `import orthon.distributed`.
+#   - Binding level: bindings/ops_bindings.cpp includes <pybind11/numpy.h> and
+#     binds from_numpy() through py::array. pybind11's numpy.h does NOT require
+#     NumPy headers or its C API at C++ build time -- it reaches NumPy through
+#     Python at runtime -- but the bound array interfaces do need NumPy
+#     importable in the running interpreter when they are used.
+# The checkpoint codec deliberately does NOT use NumPy: it moves raw bytes with
+# the standard library alone (zipfile, json, hashlib), so restoring a tensor
+# needs no array package at all.
+# Floor: the whole NumPy surface the runtime touches is asarray,
+# ascontiguousarray, dtype, int64, ndarray.flags.c_contiguous and
+# ndarray.reshape -- all of which predate NumPy 1.7, so the API imposes no real
+# floor. 1.21.3 is the oldest release shipping wheels for the oldest Python
+# this package can run on (3.10 -- see requires-python above).
+# No upper bound: the suite passes on NumPy 2.x.
+dependencies = [
+    "numpy>=1.21.3",
+]
+
+# Test-only dependencies. These are reference/comparison libraries used by the
+# test suite; neither is imported by the orthon runtime package.
+# torchvision is deliberately NOT listed: nothing under tests/ imports it. It is
+# used only by examples/ (through examples/utils/, for MNIST and CIFAR-10
+# loading), which the test suite does not run, so installing it would not enable
+# a single test.
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0",
+    "torch>=2.0",
+]
+
+[tool.scikit-build]
+cmake.build-type = "Release"
+# The runtime package source lives under python/orthon/ and is installed as the
+# top-level `orthon` package; CMake installs the _C extension alongside it.
+wheel.packages = ["python/orthon"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]

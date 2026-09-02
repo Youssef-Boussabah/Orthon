@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" width="96" height="96" role="img" aria-label="Orthon">
+  <title>Orthon</title>
+  <style>
+    .mark { fill: #14171c; }
+    @media (prefers-color-scheme: dark) { .mark { fill: #eef1f5; } }
+  </style>
+  <g class="mark">
+    <!-- An "O" built from four right-angle brackets: a closed counter, broken
+         at the axis midpoints, drawn entirely on the orthogonal grid. -->
+    <path d="M10 10 H44 V22 H22 V44 H10 Z"/>
+    <path d="M86 10 V44 H74 V22 H52 V10 Z"/>
+    <path d="M86 86 H52 V74 H74 V52 H86 Z"/>
+    <path d="M10 86 V52 H22 V74 H44 V86 Z"/>
+  </g>
+</svg>
