@@ -1,8 +1,16 @@
+
+<p align="center">
+  <img src="assets/orthon.svg" alt="Orthon logo" width="96" height="96">
+</p>
+
+<div align="center">
+
 # Orthon
 
-<img src="assets/orthon.svg" alt="Orthon mark" width="64">
+### A compact C++17/CUDA tensor and autograd runtime with a PyTorch-style Python API.
 
-A compact C++17/CUDA tensor and autograd runtime with a PyTorch-style Python API.
+</div>
+
 Orthon **1.0.0rc1** is a prerelease intended for developer evaluation.
 It is not a stable or production-qualified release.
 See the [release notes](RELEASE_NOTES.md), [changelog](CHANGELOG.md) and
