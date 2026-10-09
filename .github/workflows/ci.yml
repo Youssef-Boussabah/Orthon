@@ -1,18 +1,5 @@
-# Orthon CPU CI.
-#
-# Scope note, stated up front because it is the most important thing about this
-# file: THERE IS NO CUDA JOB HERE, and that is deliberate. GitHub-hosted runners
-# have no NVIDIA GPU, so a "CUDA" job on them could only compile CPU sources, or
-# build CUDA code it can never execute. Either would report green while proving
-# nothing. CUDA is validated OFF this runner instead: single-GPU work on a
-# local RTX 4070 Laptop machine (full CUDA Python suite, CUDA native build,
-# CUDA native CTest), and the multi-GPU stack - cuda:0/cuda:1 placement, peer
-# copies, cross-GPU autograd, NCCL, and 2-rank blocking/bucketed/overlap DDP -
-# on a machine with two NVIDIA A100-SXM4-80GB GPUs. What that run covers, and
-# what it does not, is set out in docs/testing.md.
-#
-# Everything below runs the same CMake presets and commands a developer runs
-# locally - there is no CI-only build system.
+# Hosted CPU checks use the same presets and commands as local development.
+# CUDA/NCCL validation requirements are documented in docs/testing.md.
 
 name: CI
 
@@ -58,7 +45,6 @@ jobs:
       # the build system.
       - name: Set up MSVC toolchain (Windows)
         if: runner.os == 'Windows'
-        # v1.13.0
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
 
       # Resolves GoogleTest: a compatible installed copy is preferred, otherwise
@@ -137,8 +123,20 @@ jobs:
       # No pass count is hard-coded here: the workflow asserts "zero failures",
       # and the expected totals live in docs/testing.md where they can be
       # updated deliberately.
-      - name: Run the Python suite
-        run: python -m pytest -q
+      - name: Run architecture layer
+        env:
+          ORTHON_TEST_PROFILE: cpu
+        run: python -m pytest -q -m architecture
+
+      - name: Run specification layer
+        env:
+          ORTHON_TEST_PROFILE: cpu
+        run: python -m pytest -q -m spec
+
+      - name: Run regression layer
+        env:
+          ORTHON_TEST_PROFILE: cpu
+        run: python -m pytest -q -m regression
 
   # --------------------------------------------------------------------------
   # Packaging. Pins the contract that a normal install needs only the declared
@@ -177,22 +175,46 @@ jobs:
       - name: Assert the artifacts are named and laid out as orthon
         run: |
           python - <<'PY'
-          import glob, sys, zipfile
-          wheels, sdists = glob.glob("dist/*.whl"), glob.glob("dist/*.tar.gz")
-          if len(wheels) != 1 or len(sdists) != 1:
-              sys.exit(f"expected one wheel and one sdist, found {wheels} {sdists}")
-          for path in wheels + sdists:
-              name = path.rsplit("/", 1)[-1]
-              if not name.startswith("orthon-0."):
-                  sys.exit(f"{name} is not an orthon distribution")
-          names = zipfile.ZipFile(wheels[0]).namelist()
-          if not any(n.startswith("orthon/") for n in names):
-              sys.exit("wheel has no orthon/ package directory")
-          tops = {n.split("/")[0] for n in names if "/" in n}
-          extra = {t for t in tops if t != "orthon" and not t.endswith(".dist-info")}
-          if extra:
-              sys.exit(f"wheel ships unexpected top-level entries: {sorted(extra)}")
-          print(f"{wheels[0]} and {sdists[0]}: orthon only")
+          from email.parser import BytesParser
+          from pathlib import Path
+          import tarfile
+          try:
+              import tomllib
+          except ModuleNotFoundError:  # Python 3.10 source-test execution.
+              import tomli as tomllib
+          import zipfile
+
+          project = tomllib.loads(Path("pyproject.toml").read_text())["project"]
+          name, version = project["name"], project["version"]
+          wheels, sdists = list(Path("dist").glob("*.whl")), list(Path("dist").glob("*.tar.gz"))
+          assert len(wheels) == len(sdists) == 1, (wheels, sdists)
+          license_bytes = Path("LICENSE").read_bytes()
+
+          def validate_metadata(blob):
+              meta = BytesParser().parsebytes(blob)
+              assert meta["Name"] == name, meta["Name"]
+              assert meta["Version"] == version, meta["Version"]
+              assert tuple(map(int, meta["Metadata-Version"].split("."))) >= (2, 4)
+              assert meta["License-Expression"] == project["license"] == "MIT"
+              assert "LICENSE" in meta.get_all("License-File", [])
+
+          with zipfile.ZipFile(wheels[0]) as wheel:
+              names = wheel.namelist()
+              metadata = [p for p in names if p.endswith(".dist-info/METADATA")]
+              assert len(metadata) == 1, metadata
+              validate_metadata(wheel.read(metadata[0]))
+              assert any(p.startswith(name + "/") for p in names)
+              dist_info = metadata[0].split("/")[0]
+              assert {p.split("/")[0] for p in names} <= {name, dist_info}
+              assert wheel.read(dist_info + "/licenses/LICENSE") == license_bytes
+
+          with tarfile.open(sdists[0], "r:gz") as sdist:
+              members = sdist.getnames()
+              expected_root = name.replace("-", "_") + "-" + version
+              assert {p.split("/")[0] for p in members} == {expected_root}
+              validate_metadata(sdist.extractfile(expected_root + "/PKG-INFO").read())
+              assert sdist.extractfile(expected_root + "/LICENSE").read() == license_bytes
+          print(f"{wheels[0]} and {sdists[0]}: {name} {version}, MIT license verified")
           PY
 
       # A wheel build must never pull in a C++ test framework. CMakeLists.txt

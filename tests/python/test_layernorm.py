@@ -1,3 +1,4 @@
+from tests.support.capabilities import orthon_cuda_available as _cuda_available
 import pytest
 
 import orthon as ortho
@@ -7,17 +8,9 @@ import orthon.nn as nn
 torch = pytest.importorskip("torch")
 
 
-def _cuda_available():
-    if not torch.cuda.is_available():
-        return False
-    try:
-        ortho.zeros([1]).to("cuda")
-        return True
-    except RuntimeError:
-        return False
 
 
-requires_cuda = pytest.mark.skipif(not _cuda_available(), reason="CUDA not available")
+requires_cuda = pytest.mark.skipif(not (torch.cuda.is_available() and _cuda_available()), reason="CUDA not available")
 
 
 def _tensor_from_values(values, shape, device="cpu", requires_grad=False):

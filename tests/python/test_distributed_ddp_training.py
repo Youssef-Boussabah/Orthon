@@ -134,7 +134,7 @@ def _ddp_training_worker(
             # A stale-state regression shows up here as a step where the count
             # does not advance - the exact signature of the bug where step 2+
             # silently stopped launching collectives.
-            launch_counts.append(ddp_model._overlap_bucket_launch_count)
+            launch_counts.append(ddp_model._reducer.diagnostics()["async_launches"])
             if manual_sync:
                 ddp_model.all_reduce_gradients()
             optimizer.step()
@@ -297,15 +297,9 @@ def test_local_ddp_bucketed_auto_sync_sgd_matches_single_process_full_batch():
 
 
 def test_local_ddp_overlap_multi_step_stays_synchronized_and_matches_reference():
-    """Multi-step overlap DDP with the documented optimizer.zero_grad() loop.
+    """Overlap participation resets on every backward with the optimizer.zero_grad() loop.
 
-    This is the CPU-CI regression for the 2x A100 finding: overlap mode's
-    per-backward bookkeeping was reset only by ddp_model.zero_grad(), so with
-    the documented `optimizer.zero_grad()` sequence the second and later
-    backwards launched no bucket collectives at all and ranks silently trained
-    on local gradients. The shards differ per rank on purpose - a skipped
-    all-reduce makes the ranks' parameters visibly diverge here.
-    """
+    Repeated steps must remain synchronized and match the single-model reference."""
     reference = _single_process_reference("sgd")
     rank_results = _run_ddp_training(
         "sgd",

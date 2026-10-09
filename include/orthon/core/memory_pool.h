@@ -13,6 +13,7 @@ struct MemoryPoolStats {
     size_t current_bytes = 0;         // Bytes currently checked out.
     size_t peak_bytes = 0;            // Peak checked-out bytes.
     size_t cached_bytes = 0;          // Bytes currently held in free lists.
+    size_t reserved_bytes = 0;        // Live + cached raw capacity; excludes scratch.
 };
 
 struct ScratchPoolStats {

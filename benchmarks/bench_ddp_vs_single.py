@@ -4,9 +4,11 @@ Local direct DDP mode runs a world_size=1 smoke with the local backend. Real
 multi-GPU scaling should be measured with the Orthon launcher and NCCL.
 """
 
+from benchmarks._support.training import update_metadata, measured, configure, options, run as run_measurement
+from benchmarks._support.environment import synchronizer, cuda_available
+
 import argparse
 import os
-import time
 
 import orthon as ortho
 import orthon.distributed as ddist
@@ -34,8 +36,7 @@ def env_backend():
 
 
 def sync(device):
-    if device.startswith("cuda"):
-        ortho.cuda_synchronize()
+    synchronizer(device, "orthon")()
 
 
 def make_model(input_dim, hidden_size, num_classes, device):
@@ -93,7 +94,7 @@ def average_loss_across_ranks(loss_value, device, world_size):
 
 def run_single(args):
     device = args.device
-    if device == "cuda" and not ortho.cuda_enabled():
+    if device == "cuda" and not cuda_available("cuda:0"):
         return {"skipped": "cuda_unavailable"}
     model = make_model(args.input_dim, args.hidden_size, args.num_classes, device)
     optimizer = SGD(model.parameters(), lr=args.lr)
@@ -104,11 +105,11 @@ def run_single(args):
     sync(device)
 
     last_loss = None
-    start = time.perf_counter()
-    for _ in range(args.steps):
-        last_loss = train_step(model, optimizer, x, targets)
-    sync(device)
-    elapsed = time.perf_counter() - start
+    with measured("bench_ddp_vs_single:start:run_single", lambda: sync(device), calls=args.steps, device=args.device, implementation="orthon", dtype="float32", config=vars(args)) as _region_start:
+        for _ in range(args.steps):
+            last_loss = train_step(model, optimizer, x, targets)
+        sync(device)
+    elapsed = _region_start["seconds"]
     return {
         "backend": "none",
         "world_size": 1,
@@ -135,7 +136,7 @@ def init_ddp_process_group(args):
                 "DDP multi-rank benchmark requires the Orthon launcher with "
                 "--backend nccl"
             )
-        if not ortho.cuda_enabled() or not ortho.nccl_enabled():
+        if not cuda_available("cuda:0") or not ortho.nccl_enabled():
             return None, {
                 "skipped": "cuda_or_nccl_unavailable",
                 "backend": "nccl",
@@ -167,7 +168,7 @@ def run_ddp(args):
         world_size = ddist.get_world_size()
         backend = backend_info[0] if isinstance(backend_info, tuple) else backend_info
         device = f"cuda:{local_rank()}" if backend == "nccl" else args.device
-        if args.device == "cuda" and not ortho.cuda_enabled():
+        if args.device == "cuda" and not cuda_available("cuda:0"):
             return {
                 "skipped": "cuda_unavailable",
                 "backend": backend,
@@ -197,12 +198,12 @@ def run_ddp(args):
         ddist.barrier()
 
         last_loss = None
-        start = time.perf_counter()
-        for _ in range(args.steps):
-            last_loss = train_step_ddp(ddp_model, optimizer, x, targets)
-        sync(device)
-        ddist.barrier()
-        elapsed = time.perf_counter() - start
+        with measured("bench_ddp_vs_single:start:run_ddp", lambda: sync(device), calls=args.steps, device=args.device, implementation="orthon", dtype="float32", config=vars(args)) as _region_start:
+            for _ in range(args.steps):
+                last_loss = train_step_ddp(ddp_model, optimizer, x, targets)
+            sync(device)
+            ddist.barrier()
+        elapsed = _region_start["seconds"]
 
         final_loss = average_loss_across_ranks(
             float(last_loss.item()),
@@ -231,6 +232,10 @@ def format_optional(value, precision=3):
 
 
 def print_summary(args, result):
+    update_metadata(backend=result.get("backend"),world_size=result.get("world_size",1),
+        device=result.get("device",args.device),transport="host/local transport" if result.get("backend")=="local" else result.get("backend"),
+        bucket_mode="bucketed",overlap=args.overlap,batch_size=args.batch_size,
+        warmup_steps=args.warmup_steps,measured_steps=args.steps)
     if "skipped" in result:
         print(
             "benchmark_name=ddp_vs_single "
@@ -284,7 +289,7 @@ def print_summary(args, result):
     print(f"ms_per_step: {result['ms_per_step']:.3f}")
     print(f"samples_per_sec: {result['samples_per_sec']:.2f}")
     print(f"final_loss: {result['final_loss']:.6f}")
-    print(f"speedup_vs_single: {format_optional(speedup)}")
+    print(f"unverified_region_ratio: {format_optional(speedup)}")
     print(f"scaling_efficiency: {format_optional(efficiency)}")
     print(f"notes: {notes}")
     print(
@@ -302,7 +307,7 @@ def print_summary(args, result):
         f"ms_per_step={result['ms_per_step']:.3f},"
         f"samples_per_sec={result['samples_per_sec']:.2f},"
         f"final_loss={result['final_loss']:.6f},"
-        f"speedup_vs_single={format_optional(speedup)},"
+        f"unverified_region_ratio={format_optional(speedup)},"
         f"scaling_efficiency={format_optional(efficiency)}"
     )
 
@@ -323,7 +328,8 @@ def parse_args():
     parser.add_argument("--baseline-ms-per-step", type=float, default=None)
     parser.add_argument("--baseline-samples-per-sec", type=float, default=None)
     parser.add_argument("--seed", type=int, default=0)
-    args = parser.parse_args()
+    options(parser)
+    args = configure(parser.parse_args())
     if args.steps < 1:
         parser.error("--steps must be at least 1")
     if args.warmup_steps < 0:
@@ -343,4 +349,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run_measurement(main, "bench_ddp_vs_single")

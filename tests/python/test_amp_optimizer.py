@@ -1,4 +1,5 @@
 """Tests for MixedPrecisionOptimizer."""
+from tests.support.capabilities import orthon_cuda_available
 import pytest
 import numpy as np
 
@@ -8,7 +9,7 @@ from orthon.nn.module import Module
 from orthon.optim import SGD, Adam
 from orthon.amp import MixedPrecisionOptimizer
 
-CUDA = ortho.cuda_enabled()
+CUDA = orthon_cuda_available()
 
 # Tiny model fixture.
 
@@ -46,9 +47,9 @@ class TestMixedPrecisionOptimizerCpuFp32:
         model = TinyNet()
         opt = MixedPrecisionOptimizer(model, SGD, lr=0.1)
         # For FP32 params, master should be the same tensor (no copy)
-        for sub_mod, name, orig_dtype, master in opt._entries:
+        for (name, parameter), orig_dtype, master in zip(model.named_parameters(), opt.state_dict()["orig_dtypes"], opt.state_dict()["masters"]):
             if orig_dtype == "float32":
-                assert master is sub_mod._parameters[name]
+                assert master is parameter
 
     def test_zero_grad_clears_model_param_grads(self):
         model = TinyNet()
@@ -147,8 +148,8 @@ class TestMixedPrecisionOptimizerCpuFp32:
         restored.load_state_dict(state)
 
         assert restored.get_lr() == pytest.approx(0.05)
-        assert restored._inner._weight_decay == pytest.approx(0.1)
-        assert restored._inner._decay_bias is True
+        assert restored.state_dict()["inner"]["weight_decay"] == pytest.approx(0.1)
+        assert restored.state_dict()["inner"]["decay_bias"] is True
 
 
 # CUDA low-precision tests.
@@ -167,13 +168,13 @@ class TestMixedPrecisionOptimizerCudaFp16:
 
     def test_fp16_masters_are_fp32(self):
         model, opt = self._make_opt("half")
-        for sub_mod, name, orig_dtype, master in opt._entries:
+        for (name, parameter), orig_dtype, master in zip(model.named_parameters(), opt.state_dict()["orig_dtypes"], opt.state_dict()["masters"]):
             if orig_dtype == "float16":
                 assert master.dtype == "float32", f"Master for {name} is {master.dtype}"
 
     def test_bf16_masters_are_fp32(self):
         model, opt = self._make_opt("bfloat16")
-        for sub_mod, name, orig_dtype, master in opt._entries:
+        for (name, parameter), orig_dtype, master in zip(model.named_parameters(), opt.state_dict()["orig_dtypes"], opt.state_dict()["masters"]):
             if orig_dtype == "bfloat16":
                 assert master.dtype == "float32", f"Master for {name} is {master.dtype}"
 
@@ -262,7 +263,7 @@ class TestMixedPrecisionOptimizerCudaFp16:
     def test_sync_to_model_restores_fp16(self):
         model, opt = self._make_opt("half")
         # Manually update a master and sync
-        _, _, _, master = opt._entries[0]
+        master = opt.state_dict()["masters"][0]
         with ortho.no_grad():
             master.add_(master, alpha=-0.001)   # small in-place tweak on FP32 master
         opt.sync_to_model()
@@ -292,7 +293,7 @@ class TestMixedPrecisionOptimizerCudaFp16:
 
     def test_state_dict_roundtrip_restores_fp32_masters(self):
         model, opt = self._make_opt("half")
-        for _, _, orig_dtype, master in opt._entries:
+        for orig_dtype, master in zip(opt.state_dict()["orig_dtypes"], opt.state_dict()["masters"]):
             if orig_dtype == "float16":
                 with ortho.no_grad():
                     master.mul_(0.0)
@@ -302,7 +303,7 @@ class TestMixedPrecisionOptimizerCudaFp16:
         restored_model, restored_opt = self._make_opt("half")
         restored_opt.load_state_dict(state)
 
-        for _, _, orig_dtype, master in restored_opt._entries:
+        for orig_dtype, master in zip(restored_opt.state_dict()["orig_dtypes"], restored_opt.state_dict()["masters"]):
             if orig_dtype == "float16":
                 assert master.dtype == "float32"
                 assert _flatten(master.to("cpu").tolist()) == pytest.approx(

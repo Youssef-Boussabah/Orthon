@@ -7,7 +7,7 @@ class Sequential(Module):
     def __init__(self, *modules):
         super().__init__()
         for i, m in enumerate(modules):
-            self._modules[str(i)] = m
+            self._register_module(str(i), m)
 
     def forward(self, x):
         for m in self._modules.values():

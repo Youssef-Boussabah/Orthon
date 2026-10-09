@@ -1,4 +1,5 @@
 import orthon as ortho
+from orthon._state import _PreparedLoad, _commit_prepared
 
 
 # Dtypes that Module.cast()/half()/bfloat16() will convert a buffer to. Buffers
@@ -19,7 +20,7 @@ class Parameter:
 
 
 class Module:
-    """Base class for all neural network modules, mirroring PyTorch's nn.Module."""
+    """Owns explicit parameter, buffer and child registration and model state."""
 
     def __init__(self):
         object.__setattr__(self, '_parameters', {})
@@ -28,101 +29,95 @@ class Module:
         object.__setattr__(self, '_modules', {})
         object.__setattr__(self, 'training', True)
 
-    # ---- buffer registration ----
-
-    def register_buffer(self, name, tensor, persistent=True):
-        """Register a non-trainable Tensor as module state.
-
-        Buffers move with .to() and cast with .cast(), are returned by
-        buffers()/named_buffers(), and are never returned by parameters().
-        A persistent buffer appears in state_dict(); a non-persistent one does
-        not, but still follows the module across devices and dtypes.
-
-        `tensor` may be None to declare the slot without materialising it yet;
-        a None buffer is skipped by enumeration, state_dict, .to() and .cast()
-        until it is assigned a real Tensor.
-        """
-        params = object.__getattribute__(self, '_parameters')
-        buffers = object.__getattribute__(self, '_buffers')
-        modules = object.__getattribute__(self, '_modules')
-        non_persistent = object.__getattribute__(self, '_non_persistent_buffers')
-
-        if not isinstance(name, str):
-            raise TypeError(
-                f"buffer name must be a string, got {type(name).__name__}")
-        if name == '':
-            raise ValueError("buffer name must not be empty")
-        if '.' in name:
-            raise ValueError(
-                f"buffer name must not contain '.' (got {name!r}); "
-                "'.' separates levels in state_dict keys")
-        if not name.isidentifier():
-            raise ValueError(f"buffer name {name!r} is not a valid attribute name")
-
-        if name in params:
-            raise KeyError(f"'{name}' is already registered as a parameter")
-        if name in modules:
-            raise KeyError(f"'{name}' is already registered as a child module")
-        if name not in buffers:
-            # Anything already reachable by attribute lookup would shadow the
-            # buffer, leaving it registered but unreadable as self.<name>.
-            if name in object.__getattribute__(self, '__dict__'):
-                raise KeyError(f"'{name}' is already an attribute of this module")
-            if hasattr(type(self), name):
-                raise KeyError(
-                    f"'{name}' is already an attribute of "
-                    f"{type(self).__name__}")
-
-        self._check_buffer_value(name, tensor)
-
-        buffers[name] = tensor
-        if persistent:
-            non_persistent.discard(name)
-        else:
-            non_persistent.add(name)
-
+    # registration: validate first, then publish one local meaning
     @staticmethod
     def _check_buffer_value(name, tensor):
-        if tensor is None:
-            return
-        if isinstance(tensor, Parameter):
-            raise TypeError(
-                f"buffer '{name}' cannot be a Parameter; buffers are not trainable")
-        if isinstance(tensor, Module):
-            raise TypeError(f"buffer '{name}' cannot be a Module")
-        if not isinstance(tensor, ortho.Tensor):
+        if tensor is not None and not isinstance(tensor, ortho.Tensor):
             raise TypeError(
                 f"buffer '{name}' expects a Tensor or None, "
                 f"got {type(tensor).__name__}")
 
-    # ---- attribute protocol ----
+    def _set_member(self, name, value, kind, *, persistent=True):
+        """Update local registration atomically.
+
+        Parameter/child assignment may replace an ordinary attribute or each other.
+        Buffer roles persist until re-registration; reject role changes before mutation.
+        Sequential permits numeric child names."""
+        params = self._parameters
+        buffers = self._buffers
+        modules = self._modules
+        attributes = object.__getattribute__(self, '__dict__')
+        if kind != 'attribute':
+            if not isinstance(name, str):
+                raise TypeError(f"{kind} name must be a string")
+            if not name or '.' in name or not (
+                name.isidentifier() or (kind == 'module' and name.isdecimal())
+            ):
+                raise ValueError(f"invalid {kind} name {name!r}")
+            if hasattr(type(self), name) or name in (
+                '_parameters', '_buffers', '_modules',
+                '_non_persistent_buffers', 'training',
+            ):
+                raise KeyError(f"'{name}' is already an attribute of this module")
+        if kind == 'buffer':
+            if name in params or name in modules or name in attributes:
+                raise KeyError(f"'{name}' is already an attribute or registered member")
+            self._check_buffer_value(name, value)
+            # Keep the established truth-value policy; evaluate before writes.
+            persistent = bool(persistent)
+        elif name in buffers:
+            raise KeyError(f"cannot assign a {kind} to registered buffer '{name}'")
+        elif kind == 'parameter':
+            if not isinstance(value, ortho.Tensor):
+                raise TypeError("registered parameter must be a Tensor")
+        elif kind == 'module':
+            if not isinstance(value, Module):
+                raise TypeError("registered child must be a Module")
+
+        if kind == 'attribute':
+            # A descriptor can reject assignment. Let it do so before cleanup.
+            object.__setattr__(self, name, value)
+        else:
+            attributes.pop(name, None)
+        if kind != 'parameter':
+            params.pop(name, None)
+        if kind != 'module':
+            modules.pop(name, None)
+        if kind != 'buffer':
+            buffers.pop(name, None)
+            self._non_persistent_buffers.discard(name)
+        if kind == 'parameter':
+            params[name] = value
+        elif kind == 'module':
+            modules[name] = value
+        elif kind == 'buffer':
+            buffers[name] = value
+            if persistent:
+                self._non_persistent_buffers.discard(name)
+            else:
+                self._non_persistent_buffers.add(name)
+
+    def _register_module(self, name, module):
+        self._set_member(name, module, 'module')
+
+    def register_buffer(self, name, tensor, persistent=True):
+        """Register Tensor/None state; nonpersistent slots transform but do not save.
+
+        Reassignment keeps the slot's persistence. None remains registered but
+        is omitted from tensor enumeration and state_dict.
+        """
+        self._set_member(name, tensor, 'buffer', persistent=persistent)
 
     def __setattr__(self, name, value):
-        params = object.__getattribute__(self, '_parameters')
-        buffers = object.__getattribute__(self, '_buffers')
-        modules = object.__getattribute__(self, '_modules')
         if isinstance(value, Parameter):
-            if name in buffers:
-                raise KeyError(
-                    f"cannot assign a Parameter to '{name}': "
-                    "it is already registered as a buffer")
-            params[name] = value._data
-            modules.pop(name, None)
+            self._set_member(name, value._data, 'parameter')
         elif isinstance(value, Module):
-            if name in buffers:
-                raise KeyError(
-                    f"cannot assign a Module to '{name}': "
-                    "it is already registered as a buffer")
-            modules[name] = value
-            params.pop(name, None)
-        elif name in buffers:
-            # Reassignment keeps the name a buffer and keeps its persistence.
-            self._check_buffer_value(name, value)
-            buffers[name] = value
+            self._register_module(name, value)
+        elif name in self._buffers:
+            self._set_member(name, value, 'buffer',
+                             persistent=name not in self._non_persistent_buffers)
         else:
-            params.pop(name, None)
-            modules.pop(name, None)
-            object.__setattr__(self, name, value)
+            self._set_member(name, value, 'attribute')
 
     def __getattr__(self, name):
         params = object.__getattribute__(self, '_parameters')
@@ -136,68 +131,88 @@ class Module:
             return modules[name]
         raise AttributeError(f"'{type(self).__name__}' has no attribute '{name}'")
 
-    # ---- enumeration ----
+    # traversal
+    def _walk_modules(self, prefix='', *, recurse=True, unique=False):
+        """Preorder paths, or unique Module owners for state transformations.
+
+        Path traversal preserves shared-child aliases. Ancestors, rather than
+        a global visited set, stop cycles without discarding sibling paths.
+        This is defensive traversal, not support for cyclic model graphs.
+        """
+        seen = set()
+
+        def walk(module, path, ancestors):
+            identity = id(module)
+            if identity in ancestors or (unique and identity in seen):
+                return
+            seen.add(identity)
+            yield path, module
+            if recurse:
+                for name, child in module._modules.items():
+                    yield from walk(child, path + name + '.', ancestors | {identity})
+
+        yield from walk(self, prefix, set())
+
+    def _state_entries(self, _prefix='', *, parameters=True, buffers=True,
+                       persistent_only=True, include_none=False, recurse=True):
+        """Yield (key, owner, kind, local_name, tensor) in registration order.
+
+        Local parameters precede buffers, then children. Values/path aliases
+        are deliberately retained; unnamed discovery alone deduplicates them.
+        Default flags are the persistent state_dict/load_state_dict protocol.
+        """
+        for prefix, module in self._walk_modules(_prefix, recurse=recurse):
+            if parameters:
+                for name, tensor in module._parameters.items():
+                    yield prefix + name, module, 'parameter', name, tensor
+            if buffers:
+                for name, tensor in module._buffers.items():
+                    if persistent_only and name in module._non_persistent_buffers:
+                        continue
+                    if tensor is not None or include_none:
+                        yield prefix + name, module, 'buffer', name, tensor
 
     def parameters(self):
-        """Recursively yield all trainable parameter tensors (no duplicates)."""
+        """Yield unique registered Tensor owners, including frozen parameters."""
         seen = set()
-
-        def _collect(module):
-            for p in module._parameters.values():
-                key = id(p)
-                if key not in seen:
-                    seen.add(key)
-                    yield p
-            for m in module._modules.values():
-                yield from _collect(m)
-
-        yield from _collect(self)
+        for _, tensor in self.named_parameters():
+            if id(tensor) not in seen:
+                seen.add(id(tensor))
+                yield tensor
 
     def named_parameters(self, prefix=""):
-        """Recursively yield (name, tensor) pairs using state_dict-style names."""
-        for name, p in self._parameters.items():
-            yield prefix + name, p
-        for mname, m in self._modules.items():
-            yield from m.named_parameters(prefix + mname + '.')
+        """Yield every registered parameter path, including tied aliases."""
+        for key, _, _, _, tensor in self._state_entries(prefix, buffers=False):
+            yield key, tensor
 
     def named_buffers(self, prefix="", recurse=True):
-        """Yield (name, tensor) pairs for registered buffers.
-
-        Includes non-persistent buffers. Skips buffers registered as None.
-        Names use the same hierarchical scheme as named_parameters().
-        """
-        for name, b in self._buffers.items():
-            if b is None:
-                continue
-            yield prefix + name, b
-        if recurse:
-            for mname, m in self._modules.items():
-                yield from m.named_buffers(prefix + mname + '.', recurse=True)
+        """Yield every Tensor buffer path, including nonpersistent aliases."""
+        for key, _, _, _, tensor in self._state_entries(
+            prefix, parameters=False, persistent_only=False, recurse=recurse,
+        ):
+            yield key, tensor
 
     def buffers(self, recurse=True):
-        """Yield registered buffer tensors (no duplicates)."""
+        """Yield unique buffer Tensor owners; omit None slots."""
         seen = set()
-        for _, b in self.named_buffers(recurse=recurse):
-            key = id(b)
-            if key not in seen:
-                seen.add(key)
-                yield b
+        for _, tensor in self.named_buffers(recurse=recurse):
+            if id(tensor) not in seen:
+                seen.add(id(tensor))
+                yield tensor
 
-    # ---- training mode ----
+    # training mode
+    def _set_training(self, training):
+        for _, module in self._walk_modules(unique=True):
+            module.training = training
+        return self
 
     def train(self):
-        """Set this module and child modules to training mode. Returns self."""
-        self.training = True
-        for m in self._modules.values():
-            m.train()
-        return self
+        """Recursively set training mode. Returns self."""
+        return self._set_training(True)
 
     def eval(self):
-        """Set this module and child modules to eval mode. Returns self."""
-        self.training = False
-        for m in self._modules.values():
-            m.eval()
-        return self
+        """Recursively set evaluation mode. Returns self."""
+        return self._set_training(False)
 
     def zero_grad(self):
         """Zero out gradients for all parameters."""
@@ -205,104 +220,84 @@ class Module:
             if p.grad is not None:
                 p.zero_grad()
 
-    # ---- device and dtype ----
+    # device and dtype
+    def _apply_tensor_transform(self, transform, *, floating_buffers_only=False):
+        """Prepare each unique owner once, then publish graph-free model state.
+
+        Parameter Python owners survive; buffer-only owners are replaced as
+        before. Buffer ties (including aliases of parameters) remain tied.
+        Preparation completes before any owner/registration mutation, so an
+        unsupported later conversion leaves the whole model unchanged.
+        """
+        modules = [m for _, m in self._walk_modules(unique=True)]
+        parameter_ids = {id(p) for m in modules for p in m._parameters.values()}
+        owners = {}
+        buffer_slots = []
+        for module in modules:
+            for p in module._parameters.values():
+                owners.setdefault(id(p), p)
+            for name, b in module._buffers.items():
+                if b is None or (floating_buffers_only and
+                                 b.dtype not in _FLOATING_DTYPES and
+                                 id(b) not in parameter_ids):
+                    continue
+                owners.setdefault(id(b), b)
+                buffer_slots.append((module, name, b))
+        prepared = {}
+        with ortho.no_grad():
+            for identity, tensor in owners.items():
+                transformed = transform(tensor)
+                if transformed.shape != tensor.shape:
+                    raise RuntimeError("model transform must preserve shape")
+                # Same-dtype cast may return the original nonleaf value.
+                # Registered model transformations must publish leaves.
+                if not transformed.is_leaf:
+                    transformed = transformed.to(transformed.device)
+                transformed.requires_grad_(tensor.requires_grad)
+                prepared[identity] = transformed
+            for identity in parameter_ids:
+                owners[identity]._rebind_model_value_(prepared[identity])
+                prepared[identity] = owners[identity]
+            for module, name, original in buffer_slots:
+                module._set_member(
+                    name, prepared[id(original)], 'buffer',
+                    persistent=name not in module._non_persistent_buffers,
+                )
+        return self
 
     def to(self, device):
-        """Move all parameters and buffers to device in-place. Returns self.
-
-        Model-state transformation, not an autograd operation: public to()
-        is differentiable, so the moves run under an explicit no_grad region
-        and every moved Parameter stays a detached leaf with its requires_grad
-        setting preserved.
-        """
-        with ortho.no_grad():
-            for name in list(self._parameters.keys()):
-                p = self._parameters[name]
-                requires_grad = p.requires_grad
-                moved = p.to(device)
-                moved.requires_grad_(requires_grad)
-                self._parameters[name] = moved
-            for name in list(self._buffers.keys()):
-                b = self._buffers[name]
-                if b is None:
-                    continue
-                moved = b.to(device)
-                if b.requires_grad:
-                    moved.requires_grad_(True)
-                self._buffers[name] = moved
-        for m in self._modules.values():
-            m.to(device)
-        return self
+        """Move registered state to the exact device, preserving parameter owners."""
+        return self._apply_tensor_transform(lambda tensor: tensor.to(device))
 
     def cast(self, dtype):
-        """Cast all parameters and floating-point buffers to dtype. Returns self.
-
-        Model-state transformation, not an autograd operation: floating
-        cast() is differentiable, so conversions run under an explicit no_grad
-        region and every casted Parameter stays a detached leaf with its
-        requires_grad setting preserved.
-        """
-        with ortho.no_grad():
-            for name in list(self._parameters.keys()):
-                p = self._parameters[name]
-                requires_grad = p.requires_grad
-                casted = ortho.cast(p, dtype)
-                casted.requires_grad_(requires_grad)
-                self._parameters[name] = casted
-            for name in list(self._buffers.keys()):
-                b = self._buffers[name]
-                if b is None or b.dtype not in _FLOATING_DTYPES:
-                    continue
-                casted = ortho.cast(b, dtype)
-                if b.requires_grad:
-                    casted.requires_grad_(True)
-                self._buffers[name] = casted
-        for m in self._modules.values():
-            m.cast(dtype)
-        return self
+        """Cast parameters and floating buffers; preserve parameter owners."""
+        return self._apply_tensor_transform(
+            lambda tensor: ortho.cast(tensor, dtype), floating_buffers_only=True,
+        )
 
     def half(self):
-        """Cast all parameters to float16. Returns self."""
+        """Cast to float16. Returns self."""
         return self.cast("float16")
 
     def bfloat16(self):
-        """Cast all parameters to bfloat16. Returns self."""
+        """Cast to bfloat16. Returns self."""
         return self.cast("bfloat16")
 
-    # ---- persistent state ----
-
-    def _state_entries(self, _prefix=''):
-        """Yield (key, owner, kind, local_name, tensor) for each state_dict entry.
-
-        Single source of truth for state_dict() and load_state_dict(), so the
-        two can never disagree about which keys exist or what they refer to.
-        """
-        for name, p in self._parameters.items():
-            yield _prefix + name, self, 'parameter', name, p
-        for name, b in self._buffers.items():
-            if name in self._non_persistent_buffers or b is None:
-                continue
-            yield _prefix + name, self, 'buffer', name, b
-        for mname, m in self._modules.items():
-            yield from m._state_entries(_prefix + mname + '.')
-
+    # persistent state
     def state_dict(self, _prefix=''):
-        """Return {name: tensor} for parameters and persistent buffers.
+        """Return live parameter and persistent-buffer tensors by name.
 
-        The values are LIVE references to the module's current state tensors,
-        not copies: mutating a parameter afterwards is visible through a
-        state_dict taken earlier, and vice versa. That is deliberate - it is
-        what makes ``model.load_state_dict(model.state_dict())`` and in-place
-        optimizer updates work.
-
-        The file APIs are different by design: ``save_state_dict`` and
-        ``save_checkpoint`` take a SNAPSHOT of the values at save time, so
-        mutating the model afterwards cannot change what was written.
-        """
+        Values alias current model state. File save APIs instead snapshot values,
+        so later mutation cannot change an archive."""
         return {key: tensor for key, _, _, _, tensor in self._state_entries(_prefix)}
 
     def load_state_dict(self, state, strict=True):
-        """Copy values from state into matching parameters and buffers."""
+        """Copy values through the same prepared state-owner protocol as files."""
+        _commit_prepared([self._prepare_load_state_dict(state, strict=strict)])
+        return self
+
+    def _prepare_load_state_dict(self, state, strict=True, map_location=None):
+        """Validate/convert all values and placement without publishing state."""
         entries = list(self._state_entries())
         current_keys = {key for key, _, _, _, _ in entries}
         if strict:
@@ -313,22 +308,11 @@ class Module:
             if unexpected:
                 raise KeyError(f"Unexpected keys in state_dict: {sorted(unexpected)}")
 
-        # ---- Stage 1: validate and prepare. Nothing is mutated here. ----
-        #
-        # Every incoming value is turned into an INDEPENDENT tensor already on
-        # the destination's device and in the destination's dtype, before any
-        # parameter or buffer is touched. Two things fall out of that ordering:
-        #
-        #  * Self-loading is safe. state_dict() returns the live parameter
-        #    objects, so model.load_state_dict(model.state_dict()) has
-        #    `src is current`. Preparing a snapshot first means the later
-        #    in-place write cannot destroy the values it is reading from - a
-        #    float path that did current.mul_(0.0) on an aliased source would
-        #    silently zero the whole model.
-        #
-        #  * A malformed or unconvertible later entry cannot leave earlier
-        #    parameters already modified.
+        # Prepare independent destination-device/dtype values before publication.
+        # Snapshot self-loads to prevent aliases from being overwritten mid-copy;
+        # a later invalid entry must leave every owner unchanged.
         prepared = []
+        tied = {}
         for key, owner, kind, local_name, current in entries:
             if key not in state:
                 continue
@@ -343,47 +327,117 @@ class Module:
                     f"current {list(current.shape)} vs loaded {list(src.shape)}"
                 )
 
-            # to() is called UNCONDITIONALLY, including when the device already
-            # matches. Tensor::to (src/core/tensor.cpp) routes a same-device
-            # move through make_contiguous_copy / cuda_make_contiguous, both of
-            # which always allocate a fresh TensorImpl. So this is the single
-            # operation that gives independence from the source, materialises a
-            # non-contiguous source and reconciles device. Detachment is
-            # EXPLICIT: public to()/cast() are differentiable, so the no_grad
-            # region - not a side effect - is what keeps a trainable source
-            # graph out of the destination.
+            # Canonical to() always makes an independent logical copy, even on
+            # the same device, and materializes a strided source. Explicit
+            # no_grad keeps source computation history out of model state.
             with ortho.no_grad():
-                restored = src.to(current.device)
+                restored = src.to(map_location if map_location is not None else current.device)
                 if restored.dtype != current.dtype:
                     restored = ortho.cast(restored, current.dtype)
+            if kind == 'parameter':
+                identity = id(current)
+                if identity in tied:
+                    previous_key, previous = tied[identity]
+                    # Numerical consistency, including NaNs. Destination
+                    # conversion occurs first, so comparison uses loaded values.
+                    first, second = previous.tolist(), restored.tolist()
+                    if not all(a == b or (a != a and b != b)
+                               for a, b in zip(first, second)):
+                        raise ValueError(
+                            f"conflicting tied parameter state: '{previous_key}' and '{key}'")
+                    continue
+                tied[identity] = (key, restored)
             prepared.append((owner, kind, local_name, current, restored))
 
-        # ---- Stage 2: commit. ----
-        for owner, kind, local_name, current, restored in prepared:
-            if kind == 'buffer':
-                # Buffers are REPLACED, not copied into: the prepared tensor
-                # takes the entry, and the destination's own requires_grad
-                # setting is preserved rather than inherited from the source.
-                restored.requires_grad_(current.requires_grad)
-                owner._buffers[local_name] = restored
-                continue
+        # Explicit placement also transforms nonpersistent registered buffers.
+        # Incoming parameter values themselves are the prepared representation.
+        moves = []
+        parameter_ids = {id(p) for p in self.parameters()}
+        if map_location is not None:
+            loaded_buffers = {(id(owner), name) for owner, kind, name, _, _ in prepared
+                              if kind == 'buffer'}
+            transformed = {}
+            for _, owner in self._walk_modules(unique=True):
+                for name, tensor in owner._buffers.items():
+                    if tensor is None or tensor.device == map_location:
+                        continue
+                    if (id(owner), name) in loaded_buffers:
+                        continue
+                    if id(tensor) in parameter_ids:
+                        replacement = tensor
+                    else:
+                        if id(tensor) not in transformed:
+                            with ortho.no_grad():
+                                value = tensor.to(map_location)
+                                value.requires_grad_(tensor.requires_grad)
+                            transformed[id(tensor)] = value
+                        replacement = transformed[id(tensor)]
+                    moves.append((owner, name, tensor, replacement))
+        originals = {}
+        with ortho.no_grad():
+            for _, kind, _, current, _ in prepared:
+                if kind != 'parameter':
+                    continue
+                moved = map_location is not None and current.device != map_location
+                # Retain the exact old implementation, including strided layout,
+                # gradients and hooks, while the registered facade moves.
+                representation = current._model_value_reference() if moved else None
+                originals[id(current)] = (current.to(current.device), representation)
+            for _, kind, _, current, restored in prepared:
+                if kind == 'buffer' or (map_location is not None and current.device != map_location):
+                    restored.requires_grad_(current.requires_grad)
 
-            # Parameters are copied INTO, never replaced. The destination
-            # Tensor object stays the parameter, so optimizer references,
-            # post-accumulate hooks, requires_grad/is_leaf/grad_fn and .grad
-            # all survive the load. _copy_data_ moves the payload only.
-            current._copy_data_(restored)
-        return self
+        # Stage 2: prepared commit and rollback callbacks.
+        attempted = []
 
-    def _replace_parameter(self, name, tensor):
-        parts = name.split('.')
-        module = self
-        for part in parts[:-1]:
-            module = module._modules[part]
-        module._parameters[parts[-1]] = tensor
+        def commit():
+            with ortho.no_grad():
+                for owner, kind, name, current, restored in prepared:
+                    attempted.append((owner, kind, name, current))
+                    if kind == 'buffer':
+                        owner._set_member(name, restored, 'buffer',
+                                          persistent=name not in owner._non_persistent_buffers)
+                    elif map_location is not None and current.device != map_location:
+                        current._rebind_model_value_(restored)
+                    else:
+                        self._copy_state_value(current, restored)
+                for owner, name, current, replacement in moves:
+                    attempted.append((owner, 'buffer', name, current))
+                    owner._set_member(name, replacement, 'buffer',
+                                      persistent=name not in owner._non_persistent_buffers)
 
-    # ---- call protocol ----
+        def rollback():
+            with ortho.no_grad():
+                for owner, kind, name, current in reversed(attempted):
+                    if kind == 'buffer':
+                        owner._set_member(name, current, 'buffer',
+                                          persistent=name not in owner._non_persistent_buffers)
+                    else:
+                        values, representation = originals[id(current)]
+                        if representation is not None:
+                            current._rebind_model_value_(representation)
+                        self._copy_state_value(current, values)
+                attempted.clear()
 
+        def placement(parameter):
+            return (map_location if map_location is not None and id(parameter) in parameter_ids
+                    else parameter.device)
+
+        return _PreparedLoad(commit, rollback, placement)
+
+    @staticmethod
+    def _copy_state_value(destination, source):
+        """Copy prepared values while retaining destination ownership and layout.
+
+        Partition strided destinations into contiguous subviews. This preserves
+        Buffer aliases and autograd metadata without replacing the owner."""
+        if destination.is_contiguous:
+            destination._copy_data_(source.contiguous())
+        else:
+            for index in range(int(destination.shape[0])):
+                Module._copy_state_value(destination[index], source[index])
+
+    # call protocol
     def __call__(self, *args, **kwargs):
         return self.forward(*args, **kwargs)
 

@@ -1,19 +1,7 @@
-"""Gradient accumulation and Node-family composition safety.
+"""Node-family composition and accumulation with strided upstream gradients.
 
-Two things in one class of failure:
-
-  * gradient ACCUMULATION - a tensor feeding two branches where one branch
-    delivers a strided gradient, which without normalisation raises
-    "cuda_add: input 'b' is not contiguous" on CUDA;
-  * every Node family under a composed graph whose backward carries a
-    non-contiguous grad_output.
-
-MaxNode, EmbeddingNode, Conv2DNode and MaxPool2DNode can return SILENTLY WRONG
-gradients on CPU as well as CUDA when this goes wrong, so every assertion here
-compares gradient VALUES against PyTorch rather than checking existence.
-Upstream tensors are non-uniform: an all-ones upstream is invariant under
-transpose and would hide a storage-order bug.
-"""
+Nonuniform values expose logical-order errors that all-ones gradients hide."""
+from tests.support.capabilities import orthon_cuda_available
 import numpy as np
 import pytest
 
@@ -21,7 +9,7 @@ import orthon as ortho
 
 torch = pytest.importorskip("torch")
 
-CUDA = ortho.cuda_enabled()
+CUDA = orthon_cuda_available()
 requires_cuda = pytest.mark.skipif(not CUDA, reason="CUDA not available")
 requires_torch_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -68,11 +56,11 @@ def _tn(t):
     return t.detach().double().cpu().numpy().ravel()
 
 
-# ---- Accumulation across a strided and a contiguous branch ----
-
+# Accumulation across a strided and a contiguous branch
 @pytest.mark.parametrize("dev", DEVICES)
 def test_branched_accumulation_strided_plus_contiguous(dev):
-    x = _d(X23, dev); x.requires_grad_(True)
+    x = _d(X23, dev)
+    x.requires_grad_(True)
     y = ortho.tanh(x)
     branch_strided = ortho.sum(y.transpose(0, 1).contiguous() * _d(UP32, dev))
     branch_direct = ortho.sum(y * _d(OTHER23, dev))
@@ -88,19 +76,21 @@ def test_branched_accumulation_strided_plus_contiguous(dev):
 def test_the_two_branch_gradients_are_not_identical():
     """Guards the oracle: if both branches gave the same gradient, the test
     would pass even if accumulation dropped one of them."""
-    x1 = _d(X23); x1.requires_grad_(True)
+    x1 = _d(X23)
+    x1.requires_grad_(True)
     ortho.sum(ortho.tanh(x1).transpose(0, 1).contiguous() * _d(UP32)).backward()
-    x2 = _d(X23); x2.requires_grad_(True)
+    x2 = _d(X23)
+    x2.requires_grad_(True)
     ortho.sum(ortho.tanh(x2) * _d(OTHER23)).backward()
     assert not np.allclose(_npy(x1.grad), _npy(x2.grad))
 
 
-# ---- accumulation orderings ----
-
+# accumulation orderings
 @pytest.mark.parametrize("dev", DEVICES)
 @pytest.mark.parametrize("order", ["strided_first", "contiguous_first"])
 def test_accumulation_both_branch_orders(dev, order):
-    x = _d(X23, dev); x.requires_grad_(True)
+    x = _d(X23, dev)
+    x.requires_grad_(True)
     y = ortho.tanh(x)
     a = ortho.sum(y.transpose(0, 1).contiguous() * _d(UP32, dev))
     b = ortho.sum(y * _d(OTHER23, dev))
@@ -116,7 +106,8 @@ def test_accumulation_both_branch_orders(dev, order):
 
 @pytest.mark.parametrize("dev", DEVICES)
 def test_accumulation_strided_plus_strided(dev):
-    x = _d(X23, dev); x.requires_grad_(True)
+    x = _d(X23, dev)
+    x.requires_grad_(True)
     y = ortho.tanh(x)
     a = ortho.sum(y.transpose(0, 1).contiguous() * _d(UP32, dev))
     b = ortho.sum(y.transpose(0, 1).contiguous() * _d(UP32 * 0.5, dev))
@@ -131,7 +122,8 @@ def test_accumulation_strided_plus_strided(dev):
 
 @pytest.mark.parametrize("dev", DEVICES)
 def test_accumulation_contiguous_plus_contiguous_control(dev):
-    x = _d(X23, dev); x.requires_grad_(True)
+    x = _d(X23, dev)
+    x.requires_grad_(True)
     y = ortho.tanh(x)
     ortho.sum(ortho.sum(y * _d(OTHER23, dev)) + ortho.sum(y * _d(X23, dev))).backward()
     xt = _t(X23, rg=True)
@@ -142,7 +134,8 @@ def test_accumulation_contiguous_plus_contiguous_control(dev):
 
 @pytest.mark.parametrize("dev", DEVICES)
 def test_three_way_accumulation(dev):
-    x = _d(X23, dev); x.requires_grad_(True)
+    x = _d(X23, dev)
+    x.requires_grad_(True)
     y = ortho.tanh(x)
     total = ortho.sum(y.transpose(0, 1).contiguous() * _d(UP32, dev))
     total = total + ortho.sum(y * _d(OTHER23, dev))
@@ -157,11 +150,11 @@ def test_three_way_accumulation(dev):
     assert _npy(x.grad) == pytest.approx(_tn(xt.grad), abs=1e-5)
 
 
-# ---- leaf accumulation across separate backward calls ----
-
+# leaf accumulation across separate backward calls
 @pytest.mark.parametrize("dev", DEVICES)
 def test_leaf_accumulation_across_backward_calls(dev):
-    x = _d(X23, dev); x.requires_grad_(True)
+    x = _d(X23, dev)
+    x.requires_grad_(True)
     ortho.sum(ortho.tanh(x).transpose(0, 1).contiguous() * _d(UP32, dev)).backward()
     first = _npy(x.grad).copy()
     ortho.sum(ortho.tanh(x) * _d(OTHER23, dev)).backward()
@@ -181,16 +174,17 @@ def test_leaf_accumulation_across_backward_calls(dev):
 @pytest.mark.parametrize("dev", DEVICES)
 def test_stored_leaf_gradient_is_contiguous(dev):
     """A strided gradient must not be stored as .grad in strided form."""
-    x = _d(X23, dev); x.requires_grad_(True)
+    x = _d(X23, dev)
+    x.requires_grad_(True)
     ortho.sum(ortho.tanh(x).transpose(0, 1).contiguous() * _d(UP32, dev)).backward()
     assert x.grad.is_contiguous is True
 
 
-# ---- no higher-order graph metadata ----
-
+# no higher-order graph metadata
 @pytest.mark.parametrize("dev", DEVICES)
 def test_accumulated_gradient_has_no_graph_metadata(dev):
-    x = _d(X23, dev); x.requires_grad_(True)
+    x = _d(X23, dev)
+    x.requires_grad_(True)
     y = ortho.tanh(x)
     ortho.sum(ortho.sum(y.transpose(0, 1).contiguous() * _d(UP32, dev))
            + ortho.sum(y * _d(OTHER23, dev))).backward()
@@ -200,14 +194,15 @@ def test_accumulated_gradient_has_no_graph_metadata(dev):
     assert g.is_leaf is True
 
 
-# ---- Node-family composition ----
-
+# Node-family composition
 @pytest.mark.parametrize("dev", DEVICES)
 @pytest.mark.parametrize("broadcast", [False, True], ids=["same_shape", "broadcast"])
 def test_add_node_strided_grad(dev, broadcast):
     B = _vals((1, 3), 0.8) if broadcast else X23 * 0.5 + 0.3
-    a = _d(X23, dev); a.requires_grad_(True)
-    b = _d(B, dev); b.requires_grad_(True)
+    a = _d(X23, dev)
+    a.requires_grad_(True)
+    b = _d(B, dev)
+    b.requires_grad_(True)
     ortho.sum((a + b).transpose(0, 1).contiguous() * _d(UP32, dev)).backward()
     at, bt = _t(X23, rg=True), _t(B, rg=True)
     ((at + bt).transpose(0, 1).contiguous() * _t(UP32)).sum().backward()
@@ -219,8 +214,10 @@ def test_add_node_strided_grad(dev, broadcast):
 @pytest.mark.parametrize("broadcast", [False, True], ids=["same_shape", "broadcast"])
 def test_mul_node_strided_grad(dev, broadcast):
     B = _vals((1, 3), 0.8) if broadcast else X23 * 0.5 + 0.3
-    a = _d(X23, dev); a.requires_grad_(True)
-    b = _d(B, dev); b.requires_grad_(True)
+    a = _d(X23, dev)
+    a.requires_grad_(True)
+    b = _d(B, dev)
+    b.requires_grad_(True)
     ortho.sum((a * b).transpose(0, 1).contiguous() * _d(UP32, dev)).backward()
     at, bt = _t(X23, rg=True), _t(B, rg=True)
     ((at * bt).transpose(0, 1).contiguous() * _t(UP32)).sum().backward()
@@ -231,8 +228,10 @@ def test_mul_node_strided_grad(dev, broadcast):
 @pytest.mark.parametrize("dev", DEVICES)
 def test_matmul_node_strided_grad(dev):
     A, B, U = _vals((2, 3), 1.2), _vals((3, 4), 0.6), _vals((4, 2), 1.9)
-    a = _d(A, dev); a.requires_grad_(True)
-    b = _d(B, dev); b.requires_grad_(True)
+    a = _d(A, dev)
+    a.requires_grad_(True)
+    b = _d(B, dev)
+    b.requires_grad_(True)
     ortho.sum(ortho.matmul(a, b).transpose(0, 1).contiguous() * _d(U, dev)).backward()
     at, bt = _t(A, rg=True), _t(B, rg=True)
     ((at @ bt).transpose(0, 1).contiguous() * _t(U)).sum().backward()
@@ -243,9 +242,12 @@ def test_matmul_node_strided_grad(dev):
 @pytest.mark.parametrize("dev", DEVICES)
 def test_fused_linear_relu_node_strided_grad(dev):
     A, W, B, U = _vals((2, 3), 1.2), _vals((3, 4), 0.6), _vals((4,), 0.4), _vals((4, 2), 1.9)
-    a = _d(A, dev); a.requires_grad_(True)
-    w = _d(W, dev); w.requires_grad_(True)
-    bb = _d(B, dev); bb.requires_grad_(True)
+    a = _d(A, dev)
+    a.requires_grad_(True)
+    w = _d(W, dev)
+    w.requires_grad_(True)
+    bb = _d(B, dev)
+    bb.requires_grad_(True)
     ortho.sum(ortho.fused_linear_relu(a, w, bb).transpose(0, 1).contiguous() * _d(U, dev)).backward()
     at, wt, bt = _t(A, rg=True), _t(W, rg=True), _t(B, rg=True)
     (torch.relu(at @ wt + bt).transpose(0, 1).contiguous() * _t(U)).sum().backward()
@@ -257,7 +259,8 @@ def test_fused_linear_relu_node_strided_grad(dev):
 @pytest.mark.parametrize("dev", DEVICES)
 @pytest.mark.parametrize("kind", ["sum", "mean"])
 def test_reduce_node_strided_grad(dev, kind):
-    x = _d(X234, dev); x.requires_grad_(True)
+    x = _d(X234, dev)
+    x.requires_grad_(True)
     red = ortho.sum(x, dim=2) if kind == "sum" else ortho.mean(x, dim=2)
     ortho.sum(red.transpose(0, 1).contiguous() * _d(UP32b, dev)).backward()
     xt = _t(X234, rg=True)
@@ -268,7 +271,8 @@ def test_reduce_node_strided_grad(dev, kind):
 
 @pytest.mark.parametrize("dev", DEVICES)
 def test_max_node_strided_grad(dev):
-    x = _d(X234, dev); x.requires_grad_(True)
+    x = _d(X234, dev)
+    x.requires_grad_(True)
     ortho.sum(ortho.max(x, dim=2).transpose(0, 1).contiguous() * _d(UP32b, dev)).backward()
     xt = _t(X234, rg=True)
     (xt.max(2).values.transpose(0, 1).contiguous() * _t(UP32b)).sum().backward()
@@ -278,7 +282,8 @@ def test_max_node_strided_grad(dev):
 @pytest.mark.parametrize("dev", DEVICES)
 def test_reshape_node_strided_grad(dev):
     U = _vals((2, 3), 1.4)
-    x = _d(X23, dev); x.requires_grad_(True)
+    x = _d(X23, dev)
+    x.requires_grad_(True)
     ortho.sum(x.reshape([3, 2]).transpose(0, 1).contiguous() * _d(U, dev)).backward()
     xt = _t(X23, rg=True)
     (xt.reshape(3, 2).transpose(0, 1).contiguous() * _t(U)).sum().backward()
@@ -288,7 +293,8 @@ def test_reshape_node_strided_grad(dev):
 @pytest.mark.parametrize("dev", DEVICES)
 def test_transpose_node_strided_grad(dev):
     U = X23 * 0.7
-    x = _d(X23, dev); x.requires_grad_(True)
+    x = _d(X23, dev)
+    x.requires_grad_(True)
     ortho.sum(x.transpose(0, 1).transpose(0, 1).contiguous() * _d(U, dev)).backward()
     xt = _t(X23, rg=True)
     (xt.transpose(0, 1).transpose(0, 1).contiguous() * _t(U)).sum().backward()
@@ -298,7 +304,8 @@ def test_transpose_node_strided_grad(dev):
 @pytest.mark.parametrize("dev", DEVICES)
 def test_contiguous_node_strided_grad(dev):
     U = X23 * 0.7
-    x = _d(X23, dev); x.requires_grad_(True)
+    x = _d(X23, dev)
+    x.requires_grad_(True)
     y = x.transpose(0, 1).contiguous()
     ortho.sum(y.transpose(0, 1).contiguous() * _d(U, dev)).backward()
     xt = _t(X23, rg=True)
@@ -308,7 +315,8 @@ def test_contiguous_node_strided_grad(dev):
 
 @pytest.mark.parametrize("dev", DEVICES)
 def test_log_softmax_node_strided_grad(dev):
-    x = _d(X23, dev); x.requires_grad_(True)
+    x = _d(X23, dev)
+    x.requires_grad_(True)
     ortho.sum(ortho.log_softmax(x, dim=1).transpose(0, 1).contiguous() * _d(UP32, dev)).backward()
     xt = _t(X23, rg=True)
     (torch.log_softmax(xt, dim=1).transpose(0, 1).contiguous() * _t(UP32)).sum().backward()
@@ -318,7 +326,8 @@ def test_log_softmax_node_strided_grad(dev):
 @pytest.mark.parametrize("dev", DEVICES)
 def test_embedding_node_strided_grad(dev):
     W, U = _vals((4, 3), 0.9), _vals((3, 2), 1.6)
-    w = _d(W, dev); w.requires_grad_(True)
+    w = _d(W, dev)
+    w.requires_grad_(True)
     idx = ortho.from_numpy(np.ascontiguousarray(np.array([0, 2], dtype=np.int64)))
     if dev != "cpu":
         idx = idx.to(dev)
@@ -333,9 +342,12 @@ def test_embedding_node_strided_grad(dev):
 def test_conv2d_node_strided_grad(dev):
     I, K, B, U = (_vals((1, 1, 4, 4), 1.1), _vals((2, 1, 2, 2), 0.7),
                   _vals((2,), 0.5), _vals((1, 2, 3, 3), 1.5))
-    i = _d(I, dev); i.requires_grad_(True)
-    k = _d(K, dev); k.requires_grad_(True)
-    b = _d(B, dev); b.requires_grad_(True)
+    i = _d(I, dev)
+    i.requires_grad_(True)
+    k = _d(K, dev)
+    k.requires_grad_(True)
+    b = _d(B, dev)
+    b.requires_grad_(True)
     ortho.sum(ortho.conv2d(i, k, b, 1, 1, 0, 0).transpose(2, 3).contiguous() * _d(U, dev)).backward()
     it, kt, bt = _t(I, rg=True), _t(K, rg=True), _t(B, rg=True)
     (torch.nn.functional.conv2d(it, kt, bt).transpose(2, 3).contiguous() * _t(U)).sum().backward()
@@ -347,7 +359,8 @@ def test_conv2d_node_strided_grad(dev):
 @pytest.mark.parametrize("dev", DEVICES)
 def test_maxpool2d_node_strided_grad(dev):
     I, U = _vals((1, 1, 4, 4), 1.1), _vals((1, 1, 2, 2), 1.5)
-    i = _d(I, dev); i.requires_grad_(True)
+    i = _d(I, dev)
+    i.requires_grad_(True)
     ortho.sum(ortho.maxpool2d(i, 2, 2, 2, 2, 0, 0).transpose(2, 3).contiguous() * _d(U, dev)).backward()
     it = _t(I, rg=True)
     (torch.nn.functional.max_pool2d(it, 2, 2).transpose(2, 3).contiguous() * _t(U)).sum().backward()
@@ -367,15 +380,15 @@ def test_conv2d_biasless_strided_grad_still_works():
     assert sorted(layer.state_dict().keys()) == ["weight"]
 
 
-# ---- representative low-precision CUDA coverage ----
-
+# representative low-precision CUDA coverage
 @requires_cuda
 @requires_torch_cuda
 @pytest.mark.parametrize("dtype,tdtype,tol",
                          [("float16", torch.float16, 5e-2),
                           ("bfloat16", torch.bfloat16, 2e-1)])
 def test_accumulation_low_precision_cuda(dtype, tdtype, tol):
-    x = _d(X23, "cuda", dtype); x.requires_grad_(True)
+    x = _d(X23, "cuda", dtype)
+    x.requires_grad_(True)
     y = ortho.tanh(x)
     ortho.sum(ortho.sum(y.transpose(0, 1).contiguous() * _d(UP32, "cuda", dtype))
            + ortho.sum(y * _d(OTHER23, "cuda", dtype))).backward()
@@ -392,8 +405,10 @@ def test_accumulation_low_precision_cuda(dtype, tdtype, tol):
 @requires_cuda
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 def test_mul_node_strided_grad_low_precision_cuda(dtype):
-    a = _d(X23, "cuda", dtype); a.requires_grad_(True)
-    b = _d(X23 * 0.5 + 0.3, "cuda", dtype); b.requires_grad_(True)
+    a = _d(X23, "cuda", dtype)
+    a.requires_grad_(True)
+    b = _d(X23 * 0.5 + 0.3, "cuda", dtype)
+    b.requires_grad_(True)
     ortho.sum((a * b).transpose(0, 1).contiguous() * _d(UP32, "cuda", dtype)).backward()
     assert a.grad is not None and a.grad.dtype == dtype
     assert b.grad is not None and b.grad.dtype == dtype

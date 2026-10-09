@@ -1,8 +1,8 @@
 #pragma once
 #include <orthon/autograd/node.h>
 #include <orthon/autograd/grad_utils.h>
-#include <orthon/ops/cpu/binary_ops.h>
-#include <orthon/ops/cpu/shape_ops.h>
+#include <orthon/ops/binary_ops.h>
+#include <orthon/ops/shape_ops.h>
 
 namespace orthon {
 

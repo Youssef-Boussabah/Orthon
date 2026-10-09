@@ -19,13 +19,7 @@ def _normalize_padding_idx(padding_idx, num_embeddings):
 
 
 def _indices_tensor(input, device=None):
-    """Materialise host index data onto the WEIGHT's exact device.
-
-    ``device`` is the weight's Device, and the move must target it exactly:
-    a bare ``"cuda"`` spec parses to cuda:0, so an Embedding whose weight
-    lives on cuda:1 would otherwise generate its indices on cuda:0 and trip
-    "embedding: indices and weight must be on the same device".
-    """
+    """Place host indices on the weight's exact Device, including its CUDA ordinal."""
     if isinstance(input, ortho.Tensor):
         return input
     arr = np.asarray(input, dtype=np.int64)

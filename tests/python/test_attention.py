@@ -1,3 +1,5 @@
+from tests.support.capabilities import orthon_cuda_available
+from tests.support.capabilities import orthon_cuda_available as _cuda_available
 import numpy as np
 import pytest
 
@@ -8,17 +10,9 @@ import orthon.nn as nn
 torch = pytest.importorskip("torch")
 
 
-def _cuda_available():
-    if not torch.cuda.is_available():
-        return False
-    try:
-        ortho.zeros([1]).to("cuda")
-        return True
-    except RuntimeError:
-        return False
 
 
-requires_cuda = pytest.mark.skipif(not _cuda_available(), reason="CUDA not available")
+requires_cuda = pytest.mark.skipif(not (torch.cuda.is_available() and _cuda_available()), reason="CUDA not available")
 
 
 def _tensor(values, device="cpu"):
@@ -216,7 +210,7 @@ def test_multihead_self_attention_forward_shape_cpu():
     assert list(y.shape) == [2,4,8]
 
 def test_multihead_self_attention_forward_shape_cuda():
-    if not ortho.cuda_enabled():
+    if not orthon_cuda_available():
         pytest.skip("CUDA not available")
 
     x = ortho.from_numpy(np.random.randn(2, 4, 8).astype(np.float32)).to("cuda")
@@ -241,7 +235,7 @@ def test_multihead_self_attention_backward_cpu():
         assert p.grad is not None
 
 def test_multihead_self_attention_backward_cuda():
-    if not ortho.cuda_enabled():
+    if not orthon_cuda_available():
         pytest.skip("CUDA not available")
 
     x = ortho.from_numpy(np.random.randn(2, 4, 8).astype(np.float32)).to("cuda")

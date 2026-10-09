@@ -6,6 +6,7 @@ load_state_dict, device/dtype movement and checkpoint round-trips.
 These tests cover model state only. Numerical and autograd correctness is
 asserted separately against PyTorch in test_batchnorm_parity.py.
 """
+from tests.support.capabilities import orthon_cuda_available
 import os
 import tempfile
 
@@ -16,7 +17,7 @@ import orthon as ortho
 from orthon.nn import BatchNorm1d, BatchNorm2d, Linear, Sequential
 from orthon.nn.module import Module
 
-CUDA = ortho.cuda_enabled()
+CUDA = orthon_cuda_available()
 requires_cuda = pytest.mark.skipif(not CUDA, reason="CUDA not available")
 
 X1 = np.arange(12, dtype=np.float32).reshape(4, 3) * 0.5
@@ -43,8 +44,7 @@ class TinyNet(Module):
         return self.bn(self.fc(x))
 
 
-# ---- buffer registration ----
-
+# buffer registration
 @pytest.mark.parametrize("factory", [lambda: BatchNorm1d(3), lambda: BatchNorm2d(2)])
 def test_running_stats_are_registered_buffers(factory):
     bn = factory()
@@ -100,11 +100,21 @@ def test_optimizer_does_not_receive_running_stats():
     from orthon.optim import SGD
     bn = BatchNorm1d(3)
     opt = SGD(bn.parameters(), lr=0.1)
-    assert len(opt._params) == 2
+    assert len(list(bn.parameters())) == 2
+    before = {name: value.tolist() for name, value in bn.named_buffers()}
+    for p in bn.parameters():
+        p.set_grad(ortho.ones(list(p.shape)))
+    # Give buffers gradients too: optimizer traversal must still exclude them.
+    for _, value in bn.named_buffers():
+        value.set_grad(ortho.ones(list(value.shape)))
+    opt.step()
+    assert {name: value.tolist() for name, value in bn.named_buffers()} == before
+    opt.zero_grad()
+    assert all(p.grad is None for p in bn.parameters())
+    assert all(value.grad is not None for _, value in bn.named_buffers())
 
 
-# ---- no num_batches_tracked, no unrelated state ----
-
+# no num_batches_tracked, no unrelated state
 @pytest.mark.parametrize("factory", [lambda: BatchNorm1d(3), lambda: BatchNorm2d(2)])
 def test_no_num_batches_tracked_buffer(factory):
     bn = factory()
@@ -128,8 +138,7 @@ def test_training_does_not_add_state():
     assert [n for n, _ in bn.named_buffers()] == ["running_mean", "running_var"]
 
 
-# ---- state_dict ----
-
+# state_dict
 def test_state_dict_keys_affine_true():
     assert sorted(BatchNorm1d(3).state_dict().keys()) == [
         "bias", "running_mean", "running_var", "weight",
@@ -178,8 +187,7 @@ def test_sequential_state_dict_keys():
     ]
 
 
-# ---- training keeps buffers registered and on-device ----
-
+# training keeps buffers registered and on-device
 def test_training_updates_running_stats():
     bn = BatchNorm1d(3)
     bn.train()
@@ -217,8 +225,7 @@ def test_repeated_training_accumulates_momentum():
     assert bn.running_mean.tolist() == pytest.approx(expected.tolist(), abs=1e-6)
 
 
-# ---- eval uses registered state ----
-
+# eval uses registered state
 def test_eval_uses_registered_running_stats():
     bn = BatchNorm1d(3, affine=False)
     bn.running_mean = _t(np.array([1.0, 2.0, 3.0], dtype=np.float32))
@@ -242,8 +249,7 @@ def test_eval_after_training_uses_updated_stats():
     assert y.ravel() == pytest.approx(expected.ravel(), abs=1e-5)
 
 
-# ---- device and dtype ----
-
+# device and dtype
 def test_to_cpu_keeps_running_stats():
     bn = BatchNorm1d(3).to("cpu")
     assert bn.running_mean.device.is_cpu()
@@ -324,8 +330,7 @@ def test_cuda_cast_moves_and_casts_running_stats():
     assert bn.running_mean.dtype == "float16"
 
 
-# ---- load_state_dict ----
-
+# load_state_dict
 def test_load_state_dict_restores_running_stats():
     src, dst = BatchNorm1d(3), BatchNorm1d(3)
     src.train()
@@ -420,8 +425,7 @@ def test_load_state_dict_preserves_destination_device():
         src.running_mean.tolist(), abs=1e-6)
 
 
-# ---- checkpoint round trip ----
-
+# checkpoint round trip
 def _trained_net():
     net = TinyNet()
     net.train()
@@ -483,8 +487,7 @@ def test_checkpoint_roundtrip_map_location_cuda():
         mean_before, abs=1e-6)
 
 
-# ---- save_state_dict / load_state_dict round trip ----
-
+# save_state_dict / load_state_dict round trip
 def test_legacy_save_load_state_dict_preserves_running_stats():
     """save_state_dict/load_state_dict is float32-only by format; that suffices."""
     net = _trained_net()
@@ -512,8 +515,7 @@ def test_legacy_save_load_preserves_eval_output():
     assert _np(restored(_t(X1))).ravel() == pytest.approx(expected.ravel(), abs=1e-6)
 
 
-# ---- Numerical freeze ----
-
+# Numerical freeze
 def test_bn1d_training_forward_and_running_stats():
     """Normalisation uses biased variance; running_var tracks the unbiased one.
 

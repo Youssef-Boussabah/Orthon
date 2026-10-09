@@ -1,7 +1,7 @@
 #pragma once
 #include <orthon/autograd/node.h>
-#include <orthon/ops/cpu/shape_ops.h>
-#include <orthon/ops/cpu/unary_ops.h>
+#include <orthon/ops/shape_ops.h>
+#include <orthon/ops/unary_ops.h>
 #include <stdexcept>
 #include <vector>
 
@@ -38,15 +38,9 @@ public:
 
     std::vector<Tensor> backward(const Tensor& grad_output) override {
         const Tensor& input = inputs[0];
-        // An upstream node such as TransposeNode hands back a strided view, but
-        // the elementwise *_backward kernels index their gradient linearly: the
-        // CPU ones reject a strided grad_output outright and the CUDA ones read
-        // it in storage order, silently producing misordered gradients. One
-        // materialisation here covers every ActivationKind.
-        //
-        // contiguous() is a no-op when the gradient already is contiguous, and
-        // it only attaches a ContiguousNode when its input requires grad, which
-        // a gradient never does, so this introduces no higher-order graph.
+        // Elementwise backward kernels consume contiguous gradients. Materialize an
+        // upstream strided view once for every activation kind; gradient tensors do
+        // not require grad, so this introduces no higher-order graph.
         const Tensor grad = contiguous(grad_output);
         switch (kind_) {
             case ActivationKind::Sigmoid:

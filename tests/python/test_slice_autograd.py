@@ -1,31 +1,7 @@
-"""Range-view autograd for ``Tensor.slice``.
+"""Slice views scatter nonuniform gradients into each parent prefix block.
 
-``x.slice(dim, start, end)`` is a view sharing storage with ``x``, keeping the
-parent's rank and strides and offsetting by ``start * stride[dim]``, and it is
-graph-connected. A view carrying no graph metadata would sever the graph::
-
-    x.requires_grad_(True)
-    y = x.slice(1, 1, 3)      # y.requires_grad == False, no grad_fn
-
-so a loss built from ``y`` would not even require grad, and
-``loss.backward()`` would raise "tensor does not require grad".
-
-Its backward scatters the gradient into the ``[start, end)`` region along
-``dim`` of a zero tensor shaped like the parent.
-
-That scatter is the substance of this file. Unlike ``x[i]``, a general slice is
-NOT one contiguous block of a freshly contiguous parent gradient: splitting the
-parent shape around ``dim`` gives ``prefix`` runs of ``slice_len * suffix``
-elements, landing ``size(dim) * suffix`` elements apart. Every backward
-assertion therefore compares VALUES against PyTorch *and* separately pins the
-untouched regions to exactly zero and each prefix block to its own destination -
-a single flat memcpy of the right bytes into the wrong place is the failure mode
-worth guarding against, and an all-ones upstream would hide it.
-
-Python slice-key syntax is deliberately NOT part of the API: ``x[1:3]`` and
-``x[:, 1:3]`` are unsupported, and the only spelling is
-``x.slice(dim, start, end)``.
-"""
+Untouched regions remain zero. Python slice-key syntax is unsupported."""
+from tests.support.capabilities import orthon_cuda_available
 import os
 
 import numpy as np
@@ -35,7 +11,7 @@ import orthon as ortho
 
 torch = pytest.importorskip("torch")
 
-CUDA = ortho.cuda_enabled()
+CUDA = orthon_cuda_available()
 DEVICES = ["cpu"] + (["cuda"] if CUDA else [])
 requires_cuda = pytest.mark.skipif(not CUDA, reason="CUDA not available")
 
@@ -117,10 +93,7 @@ def _narrow(t, shape, dim, start, end):
     return t.narrow(d, s, e - s)
 
 
-# --------------------------------------------------------------------------
 # forward view contract, unchanged by autograd attachment
-# --------------------------------------------------------------------------
-
 VIEW_CASES = [
     # (array, (dim, start, end), shape, strides, storage_offset)
     (X5, (0, 1, 4), (3,), (1,), 1),
@@ -188,10 +161,7 @@ def test_cuda_slice_view_shares_storage_with_its_parent():
     assert g[0] == pytest.approx(X34[0], abs=1e-6)
 
 
-# --------------------------------------------------------------------------
 # forward parity with PyTorch
-# --------------------------------------------------------------------------
-
 FORWARD_CASES = [
     ("1d", X5, (0, 1, 4)),
     ("2d-dim0", X34, (0, 1, 3)),
@@ -228,10 +198,7 @@ def test_negative_bounds_use_orthon_semantics_not_python_clamping(dev):
     assert _np(got) == pytest.approx(want.double().numpy().ravel(), abs=1e-6)
 
 
-# --------------------------------------------------------------------------
 # graph metadata
-# --------------------------------------------------------------------------
-
 @pytest.mark.parametrize("dev", DEVICES)
 def test_slice_attaches_grad_fn_when_parent_requires_grad(dev):
     x = _d(X34, dev)
@@ -301,10 +268,7 @@ def test_no_grad_slice_still_shares_storage(dev):
     assert _np(s) == pytest.approx(X34[1:3].ravel(), abs=1e-6)
 
 
-# --------------------------------------------------------------------------
 # basic backward parity
-# --------------------------------------------------------------------------
-
 BACKWARD_CASES = [
     ("1d", X5, (0, 1, 4)),
     ("2d-dim0", X34, (0, 1, 3)),
@@ -431,10 +395,7 @@ def test_cuda_half_slice_scatter_zeroes_are_exact(dtype):
     assert np.count_nonzero(g[:, 1:4, :]) == UP233.size
 
 
-# --------------------------------------------------------------------------
 # Multi-run scatter: what a general slice must prove beyond an integer index
-# --------------------------------------------------------------------------
-
 @pytest.mark.parametrize("dev", DEVICES)
 def test_inner_dimension_slice_scatters_into_every_prefix_block(dev):
     """parent [2, 5, 3], slice dim=1 [1:4].
@@ -510,10 +471,7 @@ def test_every_inner_slice_window_lands_where_it_should(dev, start, end):
     assert np.all(g[:, end:, :] == 0.0)
 
 
-# --------------------------------------------------------------------------
 # empty slice
-# --------------------------------------------------------------------------
-
 @pytest.mark.parametrize("dev", DEVICES)
 @pytest.mark.parametrize("args,shape", [((1, 2, 2), (2, 0, 3)),
                                         ((0, 0, 0), (0, 5, 3)),
@@ -566,10 +524,7 @@ def test_empty_slice_contributes_nothing_to_a_branch_sum(dev):
     assert _np(x.grad) == pytest.approx(_ref(xt), abs=1e-6)
 
 
-# --------------------------------------------------------------------------
 # non-contiguous parent
-# --------------------------------------------------------------------------
-
 @pytest.mark.parametrize("dev", DEVICES)
 def test_slice_a_transposed_parent_on_an_inner_dimension(dev):
     """SliceNode -> TransposeNode -> base, with the sliced dimension not the
@@ -626,10 +581,7 @@ def test_slice_of_a_reshaped_parent(dev):
     assert _np(base.grad) == pytest.approx(_ref(bt), abs=1e-6)
 
 
-# --------------------------------------------------------------------------
 # strided grad_output arriving at SliceNode
-# --------------------------------------------------------------------------
-
 @pytest.mark.parametrize("dev", DEVICES)
 def test_strided_grad_output_into_slice_node(dev):
     """TransposeNode hands SliceNode a non-contiguous grad_output, which
@@ -668,10 +620,7 @@ def test_strided_grad_output_into_a_last_dimension_slice(dev):
     assert np.all(g[:, :, 5:] == 0.0)
 
 
-# --------------------------------------------------------------------------
 # branched / overlapping / disjoint slices
-# --------------------------------------------------------------------------
-
 @pytest.mark.parametrize("dev", DEVICES)
 def test_overlapping_leading_dimension_slices_accumulate(dev):
     up1 = _upstream((3, 5), 1.11)
@@ -794,10 +743,7 @@ def test_the_branch_upstreams_are_not_identical():
     assert not np.allclose(_upstream((2, 3, 3), 1.37), _upstream((2, 3, 3), 0.51))
 
 
-# --------------------------------------------------------------------------
 # non-leaf parent
-# --------------------------------------------------------------------------
-
 @pytest.mark.parametrize("dev", DEVICES)
 def test_slice_of_a_computed_non_leaf_parent(dev):
     x = _d(X253, dev)
@@ -829,10 +775,7 @@ def test_slice_of_a_relu_parent_reaches_the_original_leaf(dev):
     assert _np(x.grad) == pytest.approx(_ref(xt), abs=1e-6)
 
 
-# --------------------------------------------------------------------------
 # chained slices
-# --------------------------------------------------------------------------
-
 @pytest.mark.parametrize("dev", DEVICES)
 def test_chained_slices_on_the_same_dimension(dev):
     x = _d(X263, dev)
@@ -900,10 +843,7 @@ def test_three_chained_slices(dev):
     assert _np(x.grad) == pytest.approx(_ref(xt), abs=1e-6)
 
 
-# --------------------------------------------------------------------------
 # SliceNode / IndexNode composition, both orders
-# --------------------------------------------------------------------------
-
 @pytest.mark.parametrize("dev", DEVICES)
 def test_index_of_a_slice(dev):
     x = _d(X345, dev)
@@ -968,10 +908,7 @@ def test_scalar_index_of_a_slice(dev):
     assert _np(x.grad).reshape(3, 4) == pytest.approx(expected, abs=0)
 
 
-# --------------------------------------------------------------------------
 # the gradient is a plain first-order tensor
-# --------------------------------------------------------------------------
-
 @pytest.mark.parametrize("dev", DEVICES)
 def test_slice_gradient_carries_no_graph(dev):
     x = _d(X253, dev)
@@ -994,10 +931,7 @@ def test_slice_gradient_preserves_dtype_and_exact_device(dev):
     assert x.grad.device == x.device
 
 
-# --------------------------------------------------------------------------
 # the forward error contract is unchanged
-# --------------------------------------------------------------------------
-
 @pytest.mark.parametrize("dev", DEVICES)
 @pytest.mark.parametrize("args", [
     (2, 0, 1),      # dim == ndim
@@ -1036,10 +970,7 @@ def test_a_failed_slice_leaves_no_gradient_behind(dev):
     assert x.grad is None
 
 
-# --------------------------------------------------------------------------
 # The Python surface, and what it deliberately does not include
-# --------------------------------------------------------------------------
-
 def test_slice_is_the_only_new_method():
     assert hasattr(ortho.Tensor, "slice")
     for absent in ("narrow", "__index_put__", "index_select", "select"):
@@ -1089,14 +1020,11 @@ def test_setitem_semantics_are_untouched():
     assert [x.get_item([2, j]) for j in range(4)] == [3.0] * 4
 
 
-# --------------------------------------------------------------------------
 # The CUDA device-context contract, pinned at source level
-# --------------------------------------------------------------------------
-
 def _slice_ops_source():
     """The native scatter source, or None when running outside the repo."""
     path = os.path.join(os.path.dirname(__file__), "..", "..",
-                        "src", "ops", "cpu", "slice_ops.cpp")
+                        "src", "backends", "cuda", "adapters.cpp")
     if not os.path.isfile(path):
         return None
     with open(path, encoding="utf-8") as f:
@@ -1107,22 +1035,18 @@ def _cuda_branch():
     src = _slice_ops_source()
     if src is None:
         pytest.skip("native source not available next to the test tree")
-    start = src.index("#ifdef WITH_CUDA", src.index("Tensor slice_backward"))
-    return src[start:src.index("#else", start)]
+    start = src.index("Tensor cuda_slice_backward_adapter")
+    import re
+    return re.sub(r"//[^\n]*", "", src[start:src.index("\n} } }", start)])
 
 
 def test_cuda_scatter_selects_the_parent_device():
-    """The single-GPU machine this runs on cannot exercise the multi-device
-    case, so pin the call instead: the CUDA branch must select the parent's
-    device before touching its memory, because memory_pool_allocate() only
-    selects a device when it falls through to a raw cudaMalloc.
-
-    Same contract as index_backward, same spelling: the engine-wide RAII
-    DeviceGuard, never a raw cudaSetDevice."""
+    """The CUDA scatter selects the parent device before accessing its memory.
+    Check DeviceGuard placement independently of available GPU ordinals."""
     branch = _cuda_branch()
     assert "DeviceGuard guard(input_device)" in branch
-    assert branch.index("DeviceGuard guard(") < branch.index("cudaMemset")
-    assert branch.index("DeviceGuard guard(") < branch.index("cudaMemcpy2D")
+    assert branch.index("DeviceGuard guard(") < branch.index("context->memset_async")
+    assert branch.index("DeviceGuard guard(") < branch.index("context->copy_d2d_2d_async")
     assert "cudaSetDevice" not in branch
 
 
@@ -1136,9 +1060,9 @@ def test_cuda_scatter_has_no_hardcoded_device():
 def test_cuda_scatter_keeps_the_gradient_on_the_device():
     """No host round-trip for the gradient payload."""
     branch = _cuda_branch()
-    assert "cudaMemcpyDeviceToDevice" in branch
-    assert "cudaMemcpyHostToDevice" not in branch
-    assert "cudaMemcpyDeviceToHost" not in branch
+    assert "context->copy_d2d_2d_async" in branch
+    assert "copy_h2d_snapshot" not in branch
+    assert "copy_d2h_blocking" not in branch
 
 
 def test_no_custom_cuda_kernel_was_added_for_slice():
@@ -1150,5 +1074,5 @@ def test_no_custom_cuda_kernel_was_added_for_slice():
     assert "__global__" not in src
     assert "<<<" not in src
     cuda_dir = os.path.join(os.path.dirname(__file__), "..", "..",
-                            "src", "ops", "cuda")
+                            "src", "backends", "cuda")
     assert not os.path.isfile(os.path.join(cuda_dir, "slice_kernels.cu"))

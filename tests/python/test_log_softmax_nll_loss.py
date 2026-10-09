@@ -1,3 +1,4 @@
+from tests.support.capabilities import orthon_cuda_available as _cuda_available
 import numpy as np
 import pytest
 
@@ -8,17 +9,9 @@ import orthon.nn as nn
 torch = pytest.importorskip("torch")
 
 
-def _cuda_available():
-    if not torch.cuda.is_available():
-        return False
-    try:
-        ortho.zeros([1]).to("cuda")
-        return True
-    except RuntimeError:
-        return False
 
 
-requires_cuda = pytest.mark.skipif(not _cuda_available(), reason="CUDA not available")
+requires_cuda = pytest.mark.skipif(not (torch.cuda.is_available() and _cuda_available()), reason="CUDA not available")
 
 
 def _tensor(values, device="cpu"):
@@ -212,3 +205,48 @@ def test_embedding_linear_log_softmax_nll_loss_cuda_backward():
     assert log_probs.device.is_cuda()
     assert embed.weight.grad.device.is_cuda()
     assert linear.weight.grad.device.is_cuda()
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=requires_cuda)])
+@pytest.mark.parametrize("dtype", [np.int32, np.int64])
+@pytest.mark.parametrize("reduction", ["none", "sum", "mean"])
+def test_r1_nll_index_endpoints_and_reductions(device, dtype, reduction):
+    x = _tensor([[-1, -2, -3], [-4, -5, -6]], device).requires_grad_(True)
+    result = ortho.nll_loss(x, _targets([0, 2], device, dtype), reduction)
+    expected = [1, 6] if reduction == "none" else [7 if reduction == "sum" else 3.5]
+    assert result.to("cpu").tolist() == expected
+    result.backward()
+    scale = .5 if reduction == "mean" else 1
+    assert x.grad.to("cpu").tolist() == [-scale, 0, 0, 0, 0, -scale]
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=requires_cuda)])
+@pytest.mark.parametrize("dtype,value", [(np.int32, -1), (np.int32, 3), (np.int32, 2**31-1),
+                                        (np.int64, -1), (np.int64, 3), (np.int64, 2**32),
+                                        (np.int64, 2**63-1)])
+def test_r1_nll_rejects_full_width_index_domain(device, dtype, value):
+    x = _tensor([[-1, -2, -3], [-4, -5, -6]], device).requires_grad_(True)
+    version = x._storage_version
+    with pytest.raises((RuntimeError, IndexError), match="out of range"):
+        ortho.nll_loss(x, _targets([0, value], device, dtype))
+    assert x.grad is None and x._storage_version == version
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=requires_cuda)])
+@pytest.mark.parametrize("shift", [0., 1e8, -1e8])
+def test_r2_shifted_nll_and_cross_entropy_compositions(device, shift):
+    values = np.asarray([[0., 8., -8.], [16., -8., 0.]], dtype=np.float32) + np.float32(shift)
+    represented = values.astype(np.float64)
+    shifted = represented - represented.max(axis=1, keepdims=True)
+    log_reference = shifted - np.log(np.exp(shifted).sum(axis=1, keepdims=True))
+    expected_grad = np.exp(log_reference)
+    expected_grad[np.arange(2), [1, 0]] -= 1.
+    expected_grad /= 2.
+    expected_loss = -log_reference[np.arange(2), [1, 0]].mean()
+    for composition in ["nll", "cross-entropy"]:
+        x = ortho.from_numpy(values).to(device).requires_grad_(True)
+        loss = (ortho.nll_loss(ortho.log_softmax(x, 1), _targets([1, 0], device))
+                if composition == "nll" else ortho.cross_entropy(x, [1, 0]))
+        assert loss.to("cpu").item() == pytest.approx(expected_loss, abs=2e-6, rel=2e-5)
+        loss.backward()
+        np.testing.assert_allclose(x.grad.to("cpu").tolist(), expected_grad.ravel(), atol=2e-6, rtol=3e-5)

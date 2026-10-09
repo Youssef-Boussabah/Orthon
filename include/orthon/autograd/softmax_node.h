@@ -2,11 +2,11 @@
 
 #include <orthon/autograd/grad_mode.h>
 #include <orthon/autograd/node.h>
-#include <orthon/ops/cpu/binary_ops.h>
-#include <orthon/ops/cpu/reduce_ops.h>
-#include <orthon/ops/cpu/shape_ops.h>
-#include <orthon/ops/cpu/softmax_ops.h>
-#include <orthon/ops/cpu/unary_ops.h>
+#include <orthon/ops/binary_ops.h>
+#include <orthon/ops/reduce_ops.h>
+#include <orthon/ops/shape_ops.h>
+#include <orthon/ops/softmax_ops.h>
+#include <orthon/ops/unary_ops.h>
 #include <cstdint>
 #include <vector>
 

@@ -1,15 +1,6 @@
-"""Neural-network API demo.
+"""Demonstrate layers, device placement, training and model-state round trips.
 
-Demonstrates: Sequential, Linear, ReLU, Conv2d, Module.to(),
-              cross_entropy, Adam, state_dict save/load.
-
-Everything runs on one device, selected once below. Mixed-device operands are
-rejected by the runtime, so every tensor built here is placed on `device`
-explicitly rather than relying on a default.
-
-Run from repo root:
-    python examples/nn_api_demo.py
-"""
+Place every tensor on the selected device; mixed-device operands are rejected."""
 import tempfile
 import os
 import orthon

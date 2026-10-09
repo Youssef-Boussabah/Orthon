@@ -1,4 +1,6 @@
 """BFloat16 CUDA unary and binary ops compared against PyTorch bfloat16 on CUDA."""
+import orthon._diagnostics as diag
+from tests.support.capabilities import orthon_cuda_available as _cuda_available
 import numpy as np
 import pytest
 import orthon as ortho
@@ -6,12 +8,6 @@ import orthon as ortho
 torch = pytest.importorskip("torch")
 
 
-def _cuda_available():
-    try:
-        ortho.zeros([1]).to("cuda")
-        return True
-    except RuntimeError:
-        return False
 
 
 cuda_available = _cuda_available()
@@ -314,8 +310,10 @@ def test_mul_bf16_forward_broadcast():
 def test_add_bf16_backward_same_shape():
     a_np = A.astype(np.float32)
     b_np = B.astype(np.float32)
-    xa = _da_bf16(a_np); xa.requires_grad_(True)
-    xb = _da_bf16(b_np); xb.requires_grad_(True)
+    xa = _da_bf16(a_np)
+    xa.requires_grad_(True)
+    xb = _da_bf16(b_np)
+    xb.requires_grad_(True)
     ortho.add(xa, xb).backward()
     ra = torch.tensor(a_np, dtype=torch.bfloat16, device="cuda", requires_grad=True)
     rb = torch.tensor(b_np, dtype=torch.bfloat16, device="cuda", requires_grad=True)
@@ -330,8 +328,10 @@ def test_add_bf16_backward_same_shape():
 def test_mul_bf16_backward_same_shape():
     a_np = A.astype(np.float32)
     b_np = B.astype(np.float32)
-    xa = _da_bf16(a_np); xa.requires_grad_(True)
-    xb = _da_bf16(b_np); xb.requires_grad_(True)
+    xa = _da_bf16(a_np)
+    xa.requires_grad_(True)
+    xb = _da_bf16(b_np)
+    xb.requires_grad_(True)
     ortho.mul(xa, xb).backward()
     ra = torch.tensor(a_np, dtype=torch.bfloat16, device="cuda", requires_grad=True)
     rb = torch.tensor(b_np, dtype=torch.bfloat16, device="cuda", requires_grad=True)
@@ -346,8 +346,10 @@ def test_mul_bf16_backward_same_shape():
 def test_add_bf16_broadcast_backward():
     a_np = np.array([[1.0, 2.0, 3.0]], dtype=np.float32)   # (1, 3)
     b_np = np.array([[0.5], [1.5]], dtype=np.float32)       # (2, 1)
-    xa = _da_bf16(a_np); xa.requires_grad_(True)
-    xb = _da_bf16(b_np); xb.requires_grad_(True)
+    xa = _da_bf16(a_np)
+    xa.requires_grad_(True)
+    xb = _da_bf16(b_np)
+    xb.requires_grad_(True)
     ortho.add(xa, xb).backward()
     ra = torch.tensor(a_np, dtype=torch.bfloat16, device="cuda", requires_grad=True)
     rb = torch.tensor(b_np, dtype=torch.bfloat16, device="cuda", requires_grad=True)
@@ -364,8 +366,10 @@ def test_add_bf16_broadcast_backward():
 def test_mul_bf16_broadcast_backward():
     a_np = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)  # (2, 2)
     b_np = np.array([[0.5, 2.0]], dtype=np.float32)               # (1, 2)
-    xa = _da_bf16(a_np); xa.requires_grad_(True)
-    xb = _da_bf16(b_np); xb.requires_grad_(True)
+    xa = _da_bf16(a_np)
+    xa.requires_grad_(True)
+    xb = _da_bf16(b_np)
+    xb.requires_grad_(True)
     ortho.mul(xa, xb).backward()
     ra = torch.tensor(a_np, dtype=torch.bfloat16, device="cuda", requires_grad=True)
     rb = torch.tensor(b_np, dtype=torch.bfloat16, device="cuda", requires_grad=True)
@@ -382,8 +386,10 @@ def test_mul_bf16_broadcast_backward():
 def test_add_bf16_scalar_broadcast_backward():
     a_np = np.array([1.0, 2.0, 3.0], dtype=np.float32)    # (3,)
     b_np = np.array([0.5], dtype=np.float32)               # (1,), scalar-like
-    xa = _da_bf16(a_np); xa.requires_grad_(True)
-    xb = _da_bf16(b_np); xb.requires_grad_(True)
+    xa = _da_bf16(a_np)
+    xa.requires_grad_(True)
+    xb = _da_bf16(b_np)
+    xb.requires_grad_(True)
     ortho.add(xa, xb).backward()
     ra = torch.tensor(a_np, dtype=torch.bfloat16, device="cuda", requires_grad=True)
     rb = torch.tensor(b_np, dtype=torch.bfloat16, device="cuda", requires_grad=True)
@@ -424,7 +430,8 @@ def test_sum_bf16_dim1():
 @requires_torch_cuda
 def test_sum_bf16_backward_all():
     inp_np = A.astype(np.float32)
-    x = _da_bf16(inp_np); x.requires_grad_(True)
+    x = _da_bf16(inp_np)
+    x.requires_grad_(True)
     ortho.sum(x).backward()
     rx = torch.tensor(inp_np, dtype=torch.bfloat16, device="cuda", requires_grad=True)
     rx.sum().backward()
@@ -434,7 +441,8 @@ def test_sum_bf16_backward_all():
 @requires_torch_cuda
 def test_sum_bf16_backward_dim1():
     inp_np = A.astype(np.float32)
-    x = _da_bf16(inp_np); x.requires_grad_(True)
+    x = _da_bf16(inp_np)
+    x.requires_grad_(True)
     ortho.sum(x, dim=1).backward()
     rx = torch.tensor(inp_np, dtype=torch.bfloat16, device="cuda", requires_grad=True)
     rx.sum(dim=1).sum().backward()
@@ -461,7 +469,8 @@ def test_mean_bf16_dim1():
 @requires_torch_cuda
 def test_mean_bf16_backward_all():
     inp_np = A.astype(np.float32)
-    x = _da_bf16(inp_np); x.requires_grad_(True)
+    x = _da_bf16(inp_np)
+    x.requires_grad_(True)
     ortho.mean(x).backward()
     rx = torch.tensor(inp_np, dtype=torch.bfloat16, device="cuda", requires_grad=True)
     rx.mean().backward()
@@ -471,7 +480,8 @@ def test_mean_bf16_backward_all():
 @requires_torch_cuda
 def test_mean_bf16_backward_dim1():
     inp_np = A.astype(np.float32)
-    x = _da_bf16(inp_np); x.requires_grad_(True)
+    x = _da_bf16(inp_np)
+    x.requires_grad_(True)
     ortho.mean(x, dim=1).backward()
     rx = torch.tensor(inp_np, dtype=torch.bfloat16, device="cuda", requires_grad=True)
     rx.mean(dim=1).sum().backward()
@@ -499,7 +509,8 @@ def test_max_bf16_dim1():
 @requires_torch_cuda
 def test_max_bf16_backward_all():
     inp_np = A.astype(np.float32)
-    x = _da_bf16(inp_np); x.requires_grad_(True)
+    x = _da_bf16(inp_np)
+    x.requires_grad_(True)
     ortho.max(x).backward()
     rx = torch.tensor(inp_np, dtype=torch.bfloat16, device="cuda", requires_grad=True)
     rx.max().backward()
@@ -509,7 +520,8 @@ def test_max_bf16_backward_all():
 @requires_torch_cuda
 def test_max_bf16_backward_dim1():
     inp_np = A.astype(np.float32)
-    x = _da_bf16(inp_np); x.requires_grad_(True)
+    x = _da_bf16(inp_np)
+    x.requires_grad_(True)
     ortho.max(x, dim=1).backward()
     rx = torch.tensor(inp_np, dtype=torch.bfloat16, device="cuda", requires_grad=True)
     rx.max(dim=1).values.sum().backward()
@@ -564,8 +576,10 @@ def test_matmul_bf16_2d_tensor_core_shape_matches_fp32():
 def test_matmul_bf16_2d_backward():
     a_np = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
     b_np = np.array([[0.5, 1.0], [1.5, 2.0]], dtype=np.float32)
-    xa = _da_bf16(a_np); xa.requires_grad_(True)
-    xb = _da_bf16(b_np); xb.requires_grad_(True)
+    xa = _da_bf16(a_np)
+    xa.requires_grad_(True)
+    xb = _da_bf16(b_np)
+    xb.requires_grad_(True)
     ortho.matmul(xa, xb).backward()
     ra = torch.tensor(a_np, dtype=torch.bfloat16, device="cuda", requires_grad=True)
     rb = torch.tensor(b_np, dtype=torch.bfloat16, device="cuda", requires_grad=True)
@@ -595,8 +609,8 @@ def test_matmul_bf16_batched_tensor_core_shape_matches_fp32():
 
 
 def test_matmul_bf16_dispatch_matches_custom_kernel():
-    custom_2d = getattr(ortho, "_matmul_tiled_custom", None)
-    custom_batched = getattr(ortho, "_matmul_batched_tiled_custom", None)
+    custom_2d = getattr(diag, "matmul_custom", None)
+    custom_batched = getattr(diag, "batched_matmul_custom", None)
     if custom_2d is None or custom_batched is None:
         pytest.skip("custom matmul benchmark helpers unavailable")
 
@@ -680,8 +694,10 @@ def test_conv2d_bf16_backward_weight():
     wt_np   = np.random.randn(C_out, C_in, 3, 3).astype(np.float32)
     bias_np = np.zeros(C_out, dtype=np.float32)
 
-    inp_da = _da_bf16(inp_np); inp_da.requires_grad_(True)
-    wt_da  = _da_bf16(wt_np);  wt_da.requires_grad_(True)
+    inp_da = _da_bf16(inp_np)
+    inp_da.requires_grad_(True)
+    wt_da  = _da_bf16(wt_np)
+    wt_da.requires_grad_(True)
     b_da   = _da_bf16(bias_np)
     ortho.conv2d(inp_da, wt_da, b_da, 1, 1, 1, 1).backward()
 
@@ -703,8 +719,10 @@ def test_conv2d_bf16_backward_input():
     wt_np   = np.random.randn(C_out, C_in, 3, 3).astype(np.float32)
     bias_np = np.zeros(C_out, dtype=np.float32)
 
-    inp_da = _da_bf16(inp_np); inp_da.requires_grad_(True)
-    wt_da  = _da_bf16(wt_np);  wt_da.requires_grad_(True)
+    inp_da = _da_bf16(inp_np)
+    inp_da.requires_grad_(True)
+    wt_da  = _da_bf16(wt_np)
+    wt_da.requires_grad_(True)
     b_da   = _da_bf16(bias_np)
     ortho.conv2d(inp_da, wt_da, b_da, 1, 1, 1, 1).backward()
 
@@ -727,8 +745,10 @@ def test_conv2d_bf16_backward_bias():
     bias_np = np.random.randn(C_out).astype(np.float32) * 0.1
 
     inp_da = _da_bf16(inp_np)
-    wt_da  = _da_bf16(wt_np);  wt_da.requires_grad_(True)
-    b_da   = _da_bf16(bias_np); b_da.requires_grad_(True)
+    wt_da  = _da_bf16(wt_np)
+    wt_da.requires_grad_(True)
+    b_da   = _da_bf16(bias_np)
+    b_da.requires_grad_(True)
     ortho.conv2d(inp_da, wt_da, b_da, 1, 1, 1, 1).backward()
 
     import torch.nn.functional as F

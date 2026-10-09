@@ -1,29 +1,7 @@
-"""Canonical float16 / bfloat16 host conversion.
+"""Float16/BFloat16 ties-to-even, subnormal and host/device conversion parity.
 
-All four host conversions live in include/orthon/core/float_formats.h and
-implement IEEE-754 round-to-nearest, ties-to-even - the same rule NumPy,
-PyTorch and the CUDA __float2half / __float2bfloat16 intrinsics use, so the
-host agrees with the device and with both reference frameworks at once.
-
-Three entry points reach these conversions - `full`, `cast` and `from_numpy` -
-and this file exists because a per-call-site converter makes them disagree.
-The values below are what the plausible wrong implementations produce:
-
-    value        wrong result               correct
-    ---------    ------------------------   ------------------------
-    1e-5   f16   4.947185516357422e-06      1.0013580322265625e-05
-    6e-8   f16   0.0                        5.960464477539063e-08
-    65504  bf16  65280.0                    65536.0
-    1/3    bf16  0.33203125                 0.333984375
-
-The two failure modes they come from: a float16 subnormal shift written as
-`1 - exp32 - 14 + 13` is one bit too large, and truncating the mantissa for
-normals rather than rounding; and for bfloat16, `(bits + 0x8000) >> 16` is
-round-half-UP, which differs from ties-to-even on exact ties.
-
-Serialization deliberately does NOT depend on any of this: the checkpoint codec
-moves raw bytes, so a stored payload is never re-rounded.
-"""
+full(), cast() and from_numpy() share conversions; checkpoints preserve raw bits."""
+from tests.support.capabilities import orthon_cuda_available
 import numpy as np
 import pytest
 
@@ -31,7 +9,7 @@ import orthon as ortho
 
 torch = pytest.importorskip("torch")
 
-CUDA = ortho.cuda_enabled()
+CUDA = orthon_cuda_available()
 requires_cuda = pytest.mark.skipif(not CUDA, reason="CUDA not available")
 
 
@@ -88,10 +66,7 @@ def _torch_bf16_bits(value):
     return int(torch.tensor(_f32(value)).bfloat16().view(torch.uint16).item())
 
 
-# ---------------------------------------------------------------------------
 # float16 parity with NumPy, at every entry point.
-# ---------------------------------------------------------------------------
-
 @pytest.mark.parametrize("value", VALUES)
 def test_full_float16_matches_numpy(value):
     assert _bits(ortho.full([1], value, dtype="float16")) == _numpy_f16_bits(value)
@@ -140,10 +115,7 @@ def test_float16_signed_zero_preserved():
     assert _bits(ortho.full([1], 0.0, dtype="float16")) == 0x0000
 
 
-# ---------------------------------------------------------------------------
 # bfloat16 parity with PyTorch, at every entry point.
-# ---------------------------------------------------------------------------
-
 @pytest.mark.parametrize("value", VALUES + BF16_EXTRA)
 def test_full_bfloat16_matches_torch(value):
     assert _bits(ortho.full([1], value, dtype="bfloat16")) == _torch_bf16_bits(value)
@@ -201,10 +173,7 @@ def test_bfloat16_signed_zero_preserved():
     assert _bits(ortho.full([1], 0.0, dtype="bfloat16")) == 0x0000
 
 
-# ---------------------------------------------------------------------------
 # Round trips through the decode direction.
-# ---------------------------------------------------------------------------
-
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 @pytest.mark.parametrize("value", VALUES)
 def test_low_precision_readback_matches_reference(dtype, value):
@@ -233,10 +202,7 @@ def test_low_precision_widening_is_exact(dtype):
     assert wide.tolist() == low.tolist()
 
 
-# ---------------------------------------------------------------------------
 # the host must agree with the CUDA intrinsics.
-# ---------------------------------------------------------------------------
-
 @requires_cuda
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 @pytest.mark.parametrize("value", VALUES)

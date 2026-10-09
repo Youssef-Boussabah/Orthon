@@ -1,20 +1,7 @@
-"""Public softmax autograd and dimension contract.
+"""Softmax dimension and gradient contracts against numerical and closed-form oracles.
 
-``orthon.softmax`` takes a ``dim``, works at any rank, and attaches graph
-metadata. Without the metadata the severance is total::
-
-    x.requires_grad_(True)
-    y = ortho.softmax(x)      # y.requires_grad == False, no grad_fn
-
-and the loss built from ``y`` does not require grad, so ``loss.backward()``
-refuses to run.
-
-An all-ones upstream is useless for testing softmax, because every row of the
-Jacobian-vector product then cancels to zero legitimately. Every gradient
-assertion here uses a non-uniform upstream and compares VALUES against PyTorch,
-plus one PyTorch-independent closed-form oracle so a shared setup mistake
-cannot make both sides agree on a wrong answer.
-"""
+Use nonuniform upstream values because an all-ones softmax gradient cancels."""
+from tests.support.capabilities import orthon_cuda_available
 import numpy as np
 import pytest
 
@@ -23,7 +10,7 @@ import orthon as ortho
 torch = pytest.importorskip("torch")
 import torch.nn.functional as F
 
-CUDA = ortho.cuda_enabled()
+CUDA = orthon_cuda_available()
 DEVICES = ["cpu"] + (["cuda"] if CUDA else [])
 requires_cuda = pytest.mark.skipif(not CUDA, reason="CUDA not available")
 
@@ -83,10 +70,7 @@ def _ref(t):
     return t.grad.double().numpy().ravel()
 
 
-# --------------------------------------------------------------------------
 # Public API contract
-# --------------------------------------------------------------------------
-
 @pytest.mark.parametrize("dev", DEVICES)
 def test_default_dim_is_the_last_dimension(dev):
     """Existing callers wrote ortho.softmax(x) and meant row-wise. That must not
@@ -114,10 +98,7 @@ def test_output_preserves_shape_dtype_and_exact_device(dev):
     assert y.device == x.device
 
 
-# --------------------------------------------------------------------------
 # Forward parity
-# --------------------------------------------------------------------------
-
 @pytest.mark.parametrize("dev", DEVICES)
 @pytest.mark.parametrize("label,arr,dim,_up", DIM_CASES, ids=CASE_IDS)
 def test_forward_matches_torch(dev, label, arr, dim, _up):
@@ -145,10 +126,7 @@ def test_numerical_stability_with_large_magnitudes(dev, dim):
     assert y == pytest.approx(expected, abs=1e-6)
 
 
-# --------------------------------------------------------------------------
 # Graph metadata
-# --------------------------------------------------------------------------
-
 @pytest.mark.parametrize("dev", DEVICES)
 def test_softmax_attaches_grad_fn_when_input_requires_grad(dev):
     x = _d(X34, dev)
@@ -193,10 +171,7 @@ def test_global_grad_disabled_then_restored(dev):
     assert (on.requires_grad, on._has_grad_fn) == (True, True)
 
 
-# --------------------------------------------------------------------------
 # Backward parity
-# --------------------------------------------------------------------------
-
 @pytest.mark.parametrize("dev", DEVICES)
 @pytest.mark.parametrize("label,arr,dim,up", DIM_CASES, ids=CASE_IDS)
 def test_backward_matches_torch(dev, label, arr, dim, up):
@@ -258,10 +233,7 @@ def test_gradient_preserves_dtype_and_exact_device(dev):
     assert x.grad.shape == x.shape
 
 
-# --------------------------------------------------------------------------
 # First-order only: backward must not build another graph
-# --------------------------------------------------------------------------
-
 @pytest.mark.parametrize("dev", DEVICES)
 def test_softmax_backward_creates_no_higher_order_graph(dev):
     x = _d(X34, dev)
@@ -308,10 +280,7 @@ def test_softmax_attaches_a_node_in_ordinary_grad_mode(dev):
     assert probs._has_grad_fn is True
 
 
-# --------------------------------------------------------------------------
 # Composition under strided and accumulated gradients
-# --------------------------------------------------------------------------
-
 @pytest.mark.parametrize("dev", DEVICES)
 @pytest.mark.parametrize("dim", [0, 1])
 def test_strided_grad_output_into_softmax_node(dev, dim):
@@ -373,10 +342,7 @@ def test_softmax_composes_with_an_upstream_op(dev):
     assert _np(x.grad) == pytest.approx(_ref(xt), abs=1e-6)
 
 
-# --------------------------------------------------------------------------
 # Cross-entropy interaction
-# --------------------------------------------------------------------------
-
 LOGITS = _vals((4, 5), 1.9, 2.0)
 TARGETS = [2, 0, 4, 1]
 
@@ -426,10 +392,7 @@ def test_cross_entropy_gradient_survives_a_second_backward(dev):
     assert x.grad._has_grad_fn is False
 
 
-# --------------------------------------------------------------------------
 # Fast path preservation
-# --------------------------------------------------------------------------
-
 @pytest.mark.parametrize("dev", DEVICES)
 def test_2d_last_dim_still_uses_the_dedicated_fast_path(dev):
     """Runtime fingerprint rather than a source-string check.
@@ -463,10 +426,7 @@ def test_fast_path_output_still_attaches_autograd(dev):
     assert _np(x.grad) == pytest.approx(_ref(xt), abs=1e-6)
 
 
-# --------------------------------------------------------------------------
 # Dimension and dtype contract errors
-# --------------------------------------------------------------------------
-
 @pytest.mark.parametrize("dev", DEVICES)
 @pytest.mark.parametrize("dim", [2, 5, -3, -10])
 def test_invalid_dim_raises(dev, dim):
@@ -500,10 +460,7 @@ def test_non_contiguous_input_is_still_rejected(dev):
         ortho.softmax(_d(X34, dev).transpose(0, 1))
 
 
-# --------------------------------------------------------------------------
 # log_softmax must be untouched
-# --------------------------------------------------------------------------
-
 @pytest.mark.parametrize("dev", DEVICES)
 @pytest.mark.parametrize("label,arr,dim,up", DIM_CASES, ids=CASE_IDS)
 def test_log_softmax_is_unchanged(dev, label, arr, dim, up):
@@ -524,3 +481,85 @@ def test_softmax_and_log_softmax_agree(dev):
     s = _np(ortho.softmax(_d(X234, dev), 1))
     ls = _np(ortho.log_softmax(_d(X234, dev), 1))
     assert np.log(s) == pytest.approx(ls, abs=1e-5)
+
+
+R2_DIMENSIONS = [((4,), 0), ((2, 4), 1), ((2, 4), 0),
+                 ((2, 3, 4), 2), ((2, 3, 4), 1), ((2, 3, 4), -3),
+                 ((3, 1), -1)]
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=requires_cuda)])
+@pytest.mark.parametrize("shape,axis", R2_DIMENSIONS)
+@pytest.mark.parametrize("shift", [0., 1e4, 1e8, -1e4, -1e8])
+@pytest.mark.parametrize("pattern", ["equal", "near", "separated"])
+def test_r2_shifted_normalization_and_gradients(device, shape, axis, shift, pattern):
+    scale = {"equal": 0., "near": .125, "separated": 32.}[pattern]
+    offsets = (np.arange(np.prod(shape)).reshape(shape) % 4) * scale
+    values = np.asarray(offsets + shift, dtype=np.float32)
+    represented = values.astype(np.float64)
+    shifted = represented - np.max(represented, axis=axis, keepdims=True)
+    log_reference = shifted - np.log(np.exp(shifted).sum(axis=axis, keepdims=True))
+    probabilities = np.exp(log_reference)
+    upstream = np.asarray(np.linspace(-.7, 1.3, values.size).reshape(shape), dtype=np.float32)
+    for operation in [ortho.softmax, ortho.log_softmax]:
+        x = ortho.from_numpy(values).to(device).requires_grad_(True)
+        y = operation(x, axis)
+        actual = np.asarray(y.to("cpu").tolist()).reshape(shape)
+        expected = probabilities if operation is ortho.softmax else log_reference
+        np.testing.assert_allclose(actual, expected, atol=2e-6, rtol=3e-5)
+        assert np.isfinite(actual).all()
+        np.testing.assert_allclose((actual if operation is ortho.softmax else np.exp(actual)).sum(axis=axis), 1., atol=2e-6)
+        # Compare the same represented offsets: tiny differences legitimately
+        # disappear when rounded to float32 near 1e8.
+        zero_shift = ortho.from_numpy(np.asarray(represented - shift, dtype=np.float32)).to(device)
+        np.testing.assert_allclose(operation(zero_shift, axis).to("cpu").tolist(), actual.ravel(), atol=2e-6, rtol=3e-5)
+        (y * ortho.from_numpy(upstream).to(device)).sum().backward()
+        if operation is ortho.softmax:
+            derivative = probabilities * (upstream - (upstream * probabilities).sum(axis=axis, keepdims=True))
+        else:
+            derivative = upstream - probabilities * upstream.sum(axis=axis, keepdims=True)
+        np.testing.assert_allclose(x.grad.to("cpu").tolist(), derivative.ravel(), atol=3e-6, rtol=3e-5)
+        assert y.grad is None and not y.is_leaf
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=requires_cuda)])
+@pytest.mark.parametrize("width", [1, 3, 255, 256, 257])
+def test_r2_short_and_partial_softmax_reductions_match_general_route(device, width):
+    values = np.full((2, width), 1e8, dtype=np.float32)
+    row = ortho.softmax(_d(values, device), 1)
+    general = ortho.softmax(_d(values.reshape(2, 1, width), device), -1)
+    np.testing.assert_allclose(row.to("cpu").tolist(), np.full(2 * width, 1 / width), atol=2e-6)
+    np.testing.assert_allclose(row.to("cpu").tolist(), general.to("cpu").tolist(), atol=2e-6, rtol=2e-5)
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=requires_cuda)])
+@pytest.mark.parametrize("operation", [ortho.softmax, ortho.log_softmax])
+def test_r2_softmax_derivatives_match_representable_finite_differences(device, operation):
+    values = np.array([-.25, .125, .5], dtype=np.float32)
+    upstream = np.array([.3, -.2, .7], dtype=np.float32)
+    x = _d(values, device).requires_grad_(True)
+    (operation(x) * _d(upstream, device)).sum().backward()
+    epsilon = np.float32(1e-3)
+    differences = []
+    for i in range(3):
+        plus, minus = values.copy(), values.copy()
+        plus[i] += epsilon
+        minus[i] -= epsilon
+        fp = np.dot(operation(_d(plus, device)).to("cpu").tolist(), upstream)
+        fm = np.dot(operation(_d(minus, device)).to("cpu").tolist(), upstream)
+        differences.append((fp - fm) / float(plus[i] - minus[i]))
+    np.testing.assert_allclose(x.grad.to("cpu").tolist(), differences, atol=1e-4, rtol=1e-3)
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=requires_cuda)])
+@pytest.mark.parametrize("values", [[np.inf, 0.], [-np.inf, -np.inf], [np.nan, 0.],
+                                    [-np.inf, 0.], [-0., 0.], [0.]])
+def test_r2_softmax_preserves_existing_nonfinite_observations(device, values):
+    for operation in [ortho.softmax, ortho.log_softmax]:
+        row = np.asarray(operation(_d([values], device), 1).to("cpu").tolist())
+        general = np.asarray(operation(_d(values, device), 0).to("cpu").tolist())
+        np.testing.assert_allclose(row, general, equal_nan=True, atol=2e-6)
+        if np.isnan(values).any() or np.isposinf(values).any() or np.isneginf(values).all():
+            assert np.isnan(row).all()
+        elif values[0] == -np.inf:
+            assert row.tolist() == ([0., 1.] if operation is ortho.softmax else [-np.inf, 0.])

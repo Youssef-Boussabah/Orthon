@@ -1,15 +1,5 @@
-"""Conv2d(bias=False) correctness on CPU and CUDA.
-
-The biasless path synthesises a zero bias, which must land on the same device
-as the real operands. Building it with ortho.zeros([C_out]) alone gives a CPU
-float32 tensor, so after .to("cuda") the call is CUDA input, CUDA weight and a
-CPU bias, and native validation rejects it with:
-
-    RuntimeError: conv2d: input, weight, and bias must be on the same device
-
-Weights are set explicitly rather than taken from the random initialiser, and
-backward uses a fixed non-uniform upstream so the gradients are non-trivial.
-"""
+"""Biasless convolution forward/backward parity and public None-bias contracts."""
+from tests.support.capabilities import orthon_cuda_available
 import numpy as np
 import pytest
 
@@ -18,7 +8,7 @@ from orthon.nn import Conv2d
 
 torch = pytest.importorskip("torch")
 
-CUDA = ortho.cuda_enabled()
+CUDA = orthon_cuda_available()
 requires_cuda = pytest.mark.skipif(not CUDA, reason="CUDA not available")
 requires_torch_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -107,8 +97,7 @@ def _parity(cfg, device="cpu", dtype="float32", tdtype=torch.float32, tol=1e-4):
     return layer, x, y
 
 
-# ---- CPU float32 parity ----
-
+# CPU float32 parity
 @pytest.mark.parametrize("cfg", CONFIGS, ids=IDS)
 def test_cpu_biasless_parity(cfg):
     _parity(cfg)
@@ -120,8 +109,7 @@ def test_cpu_input_gradient_is_substantial():
     assert np.abs(_npy(x.grad)).max() > 0.01
 
 
-# ---- CUDA float32 correctness (the synthetic-bias path) ----
-
+# CUDA float32 correctness (the synthetic-bias path)
 @requires_cuda
 def test_cuda_biasless_forward_succeeds():
     """A bias=False Conv2d forward runs on CUDA and keeps its output there."""
@@ -152,8 +140,7 @@ def test_cuda_biasless_gradients_stay_on_device():
     assert layer.weight.grad.device.is_cuda()
 
 
-# ---- CUDA low precision ----
-
+# CUDA low precision
 @requires_cuda
 @requires_torch_cuda
 @pytest.mark.parametrize("cfg", [CONFIGS[0], CONFIGS[1]], ids=["simple3x3", "padding"])
@@ -184,8 +171,7 @@ def test_cuda_biasless_low_precision_dtype_follows_input(dtype):
     assert layer.weight.grad is not None
 
 
-# ---- module contract ----
-
+# module contract
 def test_biasless_has_no_bias_parameter():
     layer = Conv2d(2, 3, 3, bias=False)
     assert [n for n, _ in layer.named_parameters()] == ["weight"]
@@ -216,7 +202,14 @@ def test_synthetic_bias_is_not_retained_between_forwards():
 def test_biasless_optimizer_sees_only_weight():
     from orthon.optim import SGD
     layer = Conv2d(2, 3, 3, bias=False)
-    assert len(SGD(layer.parameters(), lr=0.1)._params) == 1
+    assert list(layer.parameters()) == [layer.weight]
+    before = np.asarray(layer.weight.tolist())
+    layer.weight.set_grad(ortho.ones(list(layer.weight.shape)))
+    opt = SGD(layer.parameters(), lr=0.1)
+    opt.step()
+    assert layer.weight.tolist() == pytest.approx(before - 0.1, abs=1e-6)
+    opt.zero_grad()
+    assert layer.weight.grad is None
 
 
 def test_biasless_survives_module_transforms_cpu():
@@ -238,8 +231,7 @@ def test_biasless_survives_to_and_cast(dtype):
     assert layer.weight.device.is_cuda()
 
 
-# ---- genuine errors are still reported ----
-
+# genuine errors are still reported
 @requires_cuda
 def test_device_mismatch_between_input_and_weight_still_rejected():
     layer = Conv2d(1, 1, 2, bias=False)          # weight stays on CPU
@@ -259,8 +251,7 @@ def test_channel_mismatch_still_rejected():
         layer(ortho.ones([1, 5, 6, 6]))
 
 
-# ---- exact device propagation ----
-
+# exact device propagation
 def test_conv2d_source_does_not_hardcode_cuda_string():
     import inspect
     import orthon.nn.conv2d as mod
@@ -277,8 +268,7 @@ def test_output_lands_on_the_inputs_exact_device():
     assert y.device == x.device
 
 
-# ---- bias=True is unchanged ----
-
+# bias=True is unchanged
 @pytest.mark.parametrize("cfg", [CONFIGS[0], CONFIGS[1]], ids=["simple3x3", "padding"])
 def test_cpu_bias_true_parity_unchanged(cfg):
     C_in, C_out, k, s, p, xshape = cfg

@@ -1,4 +1,6 @@
 """Float16 CUDA forward ops compared against PyTorch float16 on CUDA."""
+import orthon._diagnostics as diag
+from tests.support.capabilities import orthon_cuda_available as _cuda_available
 import numpy as np
 import pytest
 import orthon as ortho
@@ -6,12 +8,6 @@ import orthon as ortho
 torch = pytest.importorskip("torch")
 
 
-def _cuda_available():
-    try:
-        ortho.zeros([1]).to("cuda")
-        return True
-    except RuntimeError:
-        return False
 
 
 cuda_available = _cuda_available()
@@ -509,7 +505,7 @@ def test_matmul_f16_batched_non_multiple_shape_matches_torch():
 
 
 def test_matmul_f16_batched_dispatch_matches_custom_kernel():
-    custom = getattr(ortho, "_matmul_batched_tiled_custom", None)
+    custom = getattr(diag, "batched_matmul_custom", None)
     if custom is None:
         pytest.skip("custom batched matmul benchmark helper unavailable")
     a = np.random.randn(2, 13, 15).astype(np.float32) * 0.05

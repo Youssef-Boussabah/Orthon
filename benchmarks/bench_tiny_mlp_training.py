@@ -4,8 +4,10 @@ This is a smoke-friendly benchmark. It reports rough step time and loss
 trajectory only; it is not a performance claim.
 """
 
+from benchmarks._support.training import measured, configure, options, run as run_measurement
+from benchmarks._support.environment import synchronizer, cuda_available
+
 import argparse
-import time
 
 import orthon as ortho
 from orthon.nn import Linear, ReLU, Sequential
@@ -13,8 +15,7 @@ from orthon.optim import Adam
 
 
 def sync_device(device):
-    if device == "cuda":
-        ortho.cuda_synchronize()
+    synchronizer(device, "orthon")()
 
 
 def make_orthon_model(hidden, device):
@@ -36,7 +37,7 @@ def orthon_step(model, optimizer, x):
 
 
 def run_orthon(args):
-    if args.device == "cuda" and not ortho.cuda_enabled():
+    if args.device == "cuda" and not cuda_available("cuda:0"):
         return None
     model = make_orthon_model(args.hidden, args.device)
     optimizer = Adam(model.parameters(), lr=args.lr)
@@ -48,11 +49,11 @@ def run_orthon(args):
     for _ in range(args.warmup):
         orthon_step(model, optimizer, x)
     sync_device(args.device)
-    start = time.perf_counter()
-    for _ in range(args.steps):
-        losses.append(orthon_step(model, optimizer, x))
-    sync_device(args.device)
-    elapsed = time.perf_counter() - start
+    with measured("bench_tiny_mlp_training:start:run_orthon", lambda: sync_device(args.device), calls=args.steps, device=args.device, implementation="orthon", dtype="float32", config=vars(args)) as _region_start:
+        for _ in range(args.steps):
+            losses.append(orthon_step(model, optimizer, x))
+        sync_device(args.device)
+    elapsed = _region_start["seconds"]
     return {
         "first_loss": losses[0],
         "last_loss": losses[-1],
@@ -90,13 +91,13 @@ def run_torch(args):
     for _ in range(args.warmup):
         step()
     if args.device == "cuda":
-        torch.cuda.synchronize()
-    start = time.perf_counter()
-    for _ in range(args.steps):
-        losses.append(step())
-    if args.device == "cuda":
-        torch.cuda.synchronize()
-    elapsed = time.perf_counter() - start
+        synchronizer(args.device,"torch")()
+    with measured("bench_tiny_mlp_training:torch-start:run_torch", synchronizer(args.device, 'torch'), calls=args.steps, device=args.device, implementation="torch", dtype="float32", config=vars(args)) as _region_start:
+        for _ in range(args.steps):
+            losses.append(step())
+        if args.device == "cuda":
+            synchronizer(args.device,"torch")()
+    elapsed = _region_start["seconds"]
     return {
         "first_loss": losses[0],
         "last_loss": losses[-1],
@@ -112,7 +113,8 @@ def parse_args():
     parser.add_argument("--hidden", type=int, default=16)
     parser.add_argument("--lr", type=float, default=0.01)
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
-    return parser.parse_args()
+    options(parser)
+    return configure(parser.parse_args())
 
 
 def print_result(name, result):
@@ -141,4 +143,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run_measurement(main, "bench_tiny_mlp_training")

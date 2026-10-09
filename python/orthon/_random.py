@@ -1,25 +1,7 @@
-"""Framework-local random number generator.
+"""Framework-local RNG, independent of Python's global random state.
 
-Orthon owns exactly one generator instance, private to this module. Nothing
-outside gets a reference to it, and it is deliberately NOT Python's module-level
-``random`` state.
-
-That separation is the point. With a shared generator, unrelated user code --
-``random.shuffle(dataset)``, a third-party library drawing a few values at
-import time -- would silently shift model initialization, so a "reproducible"
-run would stop reproducing for reasons nowhere near the model. Conversely,
-seeding Orthon would yank the user's own sampling out from under them.
-
-The generator is left in its default process-seeded state at import, so
-constructing a layer without seeding behaves exactly as before. Determinism is
-opt-in through ``orthon.manual_seed()``, which resets this one stream; the
-modules that draw from it never reseed, so consecutive layers keep consuming
-consecutive values and stay statistically distinct.
-
-Scope is deliberately process-local Python state: no thread-local generators,
-no per-CUDA-device streams, no automatic rank offsets. A distributed user who
-wants rank-specific initialization calls ``manual_seed(base + rank)``.
-"""
+manual_seed resets one process-local stream. Layers consume consecutive
+values without reseeding; distributed callers choose any rank-specific seed."""
 import random as _stdlib_random
 
 # The single framework generator. Unseeded here on purpose (see the module

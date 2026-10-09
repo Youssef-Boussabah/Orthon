@@ -1,11 +1,12 @@
 """Tests for Module.cast(), Module.half(), Module.bfloat16()."""
+from tests.support.capabilities import orthon_cuda_available
 import pytest
 
 import orthon as ortho
 from orthon.nn import Linear, Sequential
 from orthon.nn.module import Module
 
-CUDA = ortho.cuda_enabled()
+CUDA = orthon_cuda_available()
 
 # Small nested model fixture.
 

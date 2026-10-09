@@ -1,245 +1,173 @@
 # Testing
 
-How Orthon is tested, what each layer actually proves, and where the honest
-limits are. Two validation environments produced the numbers below and are
-kept distinct throughout:
+Orthon has five test layers. Specifications define behavioral contracts;
+regressions preserve historical defects, parity and composed workloads;
+architecture fences protect source dependencies, ownership and package boundaries.
+Overlapping behavioral coverage across layers is intentional.
 
-- **the development machine** (Windows 11, MSVC 19.44, CUDA 13.2, one
-  RTX 4070 Laptop GPU, plus WSL Ubuntu 24.04 for Linux) — the ongoing local
-  matrix, re-run on the current tree;
-- **the release validation machine** (Linux, 2x NVIDIA A100-SXM4-80GB,
-  driver 580.126.16, CUDA 12.8, GCC 13.3, Python 3.12, NCCL 2.27.3) — a
-  one-time run covering everything the single-GPU machine must skip. It ran
-  the release-candidate tree as it stood immediately before the final
-  leaf-gradient-ownership correction; see
-  [the multi-GPU boundary](#cuda-and-multi-gpu-boundary).
+| Layer | Owner | Selection | Responsibility |
+| --- | --- | --- | --- |
+| native | `tests/cpp` | CTest, optionally `-L <domain>` | Native ownership, resources, kernels, autograd and API contracts |
+| regression | Most `tests/python/test_*.py` | `python -m pytest -q -m regression` | Public regressions, reference parity, workloads and hardware edge cases |
+| specification | `tests/spec` | `python -m pytest -q -m spec` | Supported/unsupported behavioral contracts |
+| architecture | Modules in `tests/support/layers.py` | `python -m pytest -q -m architecture` | Source/AST, ownership, security, build and package fences |
+| package smoke | `tests/smoke/package_smoke.py` | Standalone script against installed artifact | Runtime-only wheel/sdist installation contract |
 
-The system under test is described in [architecture.md](architecture.md); the
-per-operation coverage the suites pin is tabulated in
-[cuda_coverage.md](cuda_coverage.md).
+Native and package smoke are outside normal pytest collection. The default
+`python -m pytest -q` still runs the entire pytest suite. Each collected case has
+exactly one primary `regression`, `spec` or `architecture` marker. Strict markers
+and importlib mode are enabled in `pyproject.toml`. The three primary selections
+are disjoint and their union equals full collection. Collected paths, function
+names, parametrization and native `Suite.Case` names remain stable.
 
-## Layers
+## Prepare the package explicitly
 
-| Layer | Where it runs | What it proves |
+Use an installed wheel, a deliberate editable install, or an explicit complete
+Python package/extension stage. Tests never guess a `build/` directory when import
+fails. The caller chooses the package intentionally; keep profiles in separate
+build directories. The plain CMake build provides `build/orthon` for an explicitly
+chosen `PYTHONPATH=build` run.
+
+For a plain CPU build with Python bindings and no native test dependency:
+
+```bash
+cmake -S . -B /tmp/orthon-cpu -DCMAKE_BUILD_TYPE=Release -DWITH_CUDA=OFF -DWITH_NCCL=OFF -DBUILD_TESTING=OFF -DBUILD_PYTHON_BINDINGS=ON -DPYTHON_EXECUTABLE="$(python -c 'import sys; print(sys.executable)')"
+cmake --build /tmp/orthon-cpu --config Release
+export PYTHONPATH=/tmp/orthon-cpu
+python -c 'import orthon; print(orthon.__file__); print(orthon._C.__file__); print(orthon.cuda_enabled())'
+```
+
+Both paths should be under `/tmp/orthon-cpu/orthon`. The build stages runtime
+Python sources alongside `_C`; ordinary rebuilds update edits and add modules.
+After removing a Python source, use a fresh build directory to avoid stale copies.
+For CUDA, choose a separate directory and `-DWITH_CUDA=ON`, with a compatible
+toolkit and target architecture. `BUILD_PYTHON_BINDINGS=OFF` builds no Python stage.
+Wheel installation continues to use scikit-build-core's separate package path.
+
+```bash
+python -m pip install "torch>=2.0" --index-url https://download.pytorch.org/whl/cpu
+python -m pip install '.[test]' -C cmake.define.WITH_CUDA=OFF -C cmake.define.WITH_NCCL=OFF
+ORTHON_TEST_PROFILE=cpu python -m pytest -q
+```
+
+`ORTHON_TEST_PROFILE` is optional. Unset accepts ordinary developer runs. When
+supplied, it verifies the loaded extension before collection:
+
+| Expected profile | `cuda_enabled()` | `nccl_enabled()` |
 | --- | --- | --- |
-| Native C++ (GoogleTest + CTest) | Windows/MSVC, Linux/GCC, locally and in CI | The C++ tensor engine, autograd node contracts, device layer and the `orthon::` API spelling, with no Python in the picture |
-| Python CPU (pytest) | Locally and in CI (3.10, 3.13) | The full public API against a CPU PyTorch reference build |
-| Python CUDA (pytest) | **Locally only** | Every CUDA kernel, device-context and mixed-precision path |
-| Packaging smoke | Locally and in CI | A wheel/sdist install needs only the declared runtime dependencies |
+| `cpu` | False | False |
+| `cuda` | True | False |
+| `cuda-nccl` | True | True |
 
-## Native C++ suite
+Invalid spellings and mismatches are actionable pytest usage errors. The normal
+pytest header reports package/extension paths, flags, expected profile and Python
+version; omit `-q` to see it. Compile profile does not assert usable hardware.
 
-Twelve executables built from `tests/cpp/`, each `TEST()` registered as its own
-CTest case via `gtest_discover_tests`, so a failure names the test rather than
-the binary.
+```bash
+ORTHON_TEST_PROFILE=cpu python -m pytest -q -m architecture
+ORTHON_TEST_PROFILE=cpu python -m pytest -q -m spec
+ORTHON_TEST_PROFILE=cpu python -m pytest -q -m regression
+ORTHON_TEST_PROFILE=cpu python -m pytest --collect-only -q
+```
+
+Use `ORTHON_TEST_PROFILE=cuda` with an intentionally prepared CUDA package for
+physical validation. `PYTHONPATH=/absolute/stage` is an explicit caller choice.
+Subprocess specifications retain deliberate child environments and bounded
+process-tree supervision, and inherit the selected package.
+
+## Native registration and selection
+
+One source remains one executable; `gtest_discover_tests` registers every compiled
+case individually with a 300-second timeout. Explicit CMake domain lists are
+disjoint and fail-closed for missing registered sources. Architecture tests reject
+unregistered `.cpp`/`.cu` sources. No globbing or executable merger is used.
+Each discovered case carries `native` plus exactly one domain:
+
+| Domain | Executables |
+| --- | --- |
+| core | `test_tensor`, `test_tensor_core`, `test_float_formats`, `test_identity` |
+| runtime | `test_allocator`, `test_runtime_context`, `test_async_runtime`, `test_device_guard`, `test_dispatcher`, CUDA-only `test_async_cuda` |
+| operators | `test_backends`, `test_ops_binary`, `test_ops_shape`, `test_ops_reduce`, `test_reduction_subsystem`, `test_ops_unary`, `test_ops_to`, `test_matmul_planner`, `test_ops_matmul`, `test_indexing`, `test_ops_scalar` |
+| autograd | `test_autograd_engine` |
+| distributed | `test_distributed_runtime`, `test_distributed_cuda` |
+| compatibility | `test_compatibility_surface` |
+
+Conditional compilation determines native discovery. Use CTest listing to inspect
+the selected build; record exact discovery/status totals with each validation run.
 
 ```bash
 cmake --preset cpp-cpu-release
 cmake --build --preset cpp-cpu-release
+ctest --preset cpp-cpu-release -N
 ctest --preset cpp-cpu-release
+ctest --preset cpp-cpu-release -L runtime
+ctest --preset cpp-cpu-release -L compatibility
 ```
 
-and the CUDA equivalent:
+The CUDA equivalent uses `cpp-cuda-release`. These native presets turn bindings
+off; validation can separately enable them in a fresh build. GoogleTest is required
+only with `BUILD_TESTING=ON`: CMake prefers an installed compatible copy, otherwise
+fetches the pinned revision when allowed, and fails if unavailable. Test presets
+use `noTestsAction: error`. Package builds force testing off and need no GoogleTest.
+
+## Shared support and source tests
+
+`tests/conftest.py` owns primary markers, expected-profile verification and
+provenance. Domain fixtures stay in specification conftests. `tests/support`
+contains the layer manifest, source readers, Orthon device probe,
+scoped example loader and current compatibility consumer boundaries. Collected
+modules do not serve as helper libraries. Domain workload services remain in `tests/spec`,
+including AMP state helpers, token models and distributed parameter cases.
+
+The shared regression CUDA probe performs an actual Orthon allocation/transfer
+and returns False for an unavailable runtime. PyTorch CUDA is a separate gate
+when used as an oracle. Specification `cuda_device` remains stronger: known
+unavailability skips, unexpected errors fail. NCCL and multi-GPU tests keep real
+build/device gates. Source fences complement behavior; source text does not prove
+correct computation. Private diagnostics through `orthon._diagnostics` remain available for source
+fences and benchmark observations; they are not public application APIs. No xfail debt hides
+unsupported CUDA cases.
+
+## CPU CI and artifact smoke
+
+`.github/workflows/ci.yml` retains native Linux/Windows jobs and Python 3.10/3.13
+CPU jobs. Each Python job installs one CPU package, then executes architecture,
+specification and regression steps with `ORTHON_TEST_PROFILE=cpu`. No pass counts
+are hard-coded and no layer ignores failures. There is no CUDA CI job on hosted
+hardware.
+
+The separate package job builds a CPU wheel and sdist, inspects artifacts,
+installs each in a clean environment, checks torch is absent, and runs the
+standalone smoke without pytest. Only `python/orthon` is the wheel package;
+repository tests/support and GoogleTest artifacts must be absent. Tests are
+excluded from the runtime sdist too. Metadata architecture cases can skip on a
+bare stage but execute against an installed package.
 
 ```bash
-cmake --preset cpp-cuda-release
-cmake --build --preset cpp-cuda-release
-ctest --preset cpp-cuda-release
+python -m build -C cmake.define.WITH_CUDA=OFF -C cmake.define.WITH_NCCL=OFF
+python -m venv /tmp/orthon-wheel-smoke
+/tmp/orthon-wheel-smoke/bin/python -m pip install dist/*.whl
+/tmp/orthon-wheel-smoke/bin/python tests/smoke/package_smoke.py
 ```
 
-Both presets pin `BUILD_PYTHON_BINDINGS=OFF`, so the native suite does not
-depend on the Python extension being built.
+## Documentation fences
 
-### Counts
+`tests/python/test_documentation_architecture.py` checks documentation architecture.
+`tests/support/documentation.py` defines the explicit current-doc and major public
+export manifests. The fences check file links, explicit repository paths, command
+modules/scripts, known retired tokens, exposed Python returns and example syntax.
+The manifest matches the complete current guide set; wording and volatile pass
+counts are not contracts.
 
-`tests/cpp/` declares 194 `TEST()` cases. Not all of them exist in every
-configuration: three are compiled only in a CPU-only build (they assert that a
-CUDA target is *rejected*) and twelve only in a CUDA build, so the discovered
-totals differ by design.
+## Validation requirements
 
-| Configuration | Discovered | Passed | Skipped | Failed |
-| --- | --- | --- | --- | --- |
-| Windows MSVC, CPU | 182 | 182 | 0 | 0 |
-| Windows MSVC, CUDA (1 GPU) | 191 | 188 | 3 | 0 |
-| Linux GCC 13.3 (WSL Ubuntu 24.04), CPU | 182 | 182 | 0 | 0 |
+CPU CI runs native, architecture, specification, regression and package checks.
+There is no hosted CUDA job. Select an explicit installed package for each
+physical hardware profile; second-GPU tests require two usable devices. Known
+unsupported CUDA cast pairs and CPU-only fill paths remain visible specification
+failures without xfail. Record counts, messages and the failure ledger with the run.
 
-The row below is **historical**: it was recorded on the release-candidate
-tree, which declared 189 `TEST()` cases — five fewer than the current tree,
-whose extra five are the CPU-only leaf-gradient-ownership regressions in
-`test_ops_binary.cpp`.
-
-| Configuration | Discovered | Passed | Skipped | Failed |
-| --- | --- | --- | --- | --- |
-| Linux GCC 13.3, CUDA (2x A100, release-candidate tree) | 186 | 186 | 0 | 0 |
-
-The three single-GPU CUDA skips are the `DeviceGuard` cases that need **two or
-more** GPUs — `SelectsASecondDeviceAndRestoresTheFirst`,
-`NestedGuardsUnwindInOrder` and `ExceptionUnwindingRestoresAcrossDevices`.
-They call `GTEST_SKIP()` after querying `cudaGetDeviceCount`, so they are
-reported as skipped, never as passed. On the 2-GPU release validation run all
-three executed against a real second device and passed, which is the 186/186
-historical row. There is no other skip in any configuration, and no disabled
-test.
-
-`tests/cpp/test_identity.cpp` is a contract test rather than a behavioural one:
-it names every public type and function through `orthon::`, and defines global
-types and variables of the same names, so it fails to **compile** if anything
-in a public header leaks back into the global namespace. It doubles as a
-header-consumer smoke test for the `<orthon/...>` include spelling.
-
-## GoogleTest dependency
-
-`BUILD_TESTING` (from `include(CTest)`) is the switch.
-
-- **ON** — a compatible installed GoogleTest is preferred
-  (`find_package(GTest CONFIG)`); otherwise the pinned release in
-  `ORTHON_GTEST_COMMIT` is fetched with `FetchContent`. That pin is an
-  immutable commit, not a tag, so an upstream retag cannot change what a build
-  downloads; `ORTHON_GTEST_VERSION` records the matching release for humans.
-- **ON with `-DORTHON_FETCH_GTEST=OFF` and no installed GoogleTest** —
-  configuration **fails** with an actionable message. It never succeeds while
-  registering zero tests.
-- **OFF** — no GoogleTest is required, looked for, or downloaded.
-- **scikit-build-core (`pip install .`)** — `BUILD_TESTING` is forced OFF, so
-  installing the Python package never pulls in a C++ test framework.
-
-`ctest` exits 0 when it finds no tests at all, so the test presets set
-`noTestsAction: error`; an empty suite is a failure, not a silent pass.
-
-## Python suites
-
-```bash
-python -m pytest -q            # testpaths comes from pyproject.toml
-```
-
-| Configuration | Passed | Skipped | Failed |
-| --- | --- | --- | --- |
-| CPU build | 2186 | 889 | 0 |
-| CUDA build (RTX 4070 Laptop, 1 GPU) | 3397 | 60 | 0 |
-
-The row below is **historical**, recorded on the release-candidate tree before
-the leaf-gradient-ownership regressions were added:
-
-| Configuration | Passed | Skipped | Failed |
-| --- | --- | --- | --- |
-| CUDA+NCCL build (2x A100, release-candidate tree) | 3426 | 20 | 0 |
-
-The CPU skip count is large because every CUDA-gated test skips there; that is
-the intended behaviour, not missing coverage. Of the 60 skips on one GPU, 40
-are `>=2`-device gates: on the 2-GPU machine those run and the skip count
-drops to 20, which is the historical row above. The remaining 20 are
-hardware/configuration gates (fourteen need four or eight GPUs, the rest are
-CPU-build-only cases, a dataset-availability gate, and one documented
-pre-existing skip).
-
-Two files in `tests/python/` are audits rather than behavioural tests:
-
-- `test_build_architecture.py` — the CMake source lists match the tree on disk
-  exactly (no globs, no dead entries, no missing ones); every public header
-  declares inside `namespace orthon` and opens no other namespace; every
-  project macro and environment variable carries the `ORTHON_` prefix; the
-  CMake and Python versions agree; no file is an empty placeholder; and the
-  branding asset is plain geometry with no provenance metadata.
-- `test_package_identity.py` — `import orthon` resolves the whole public
-  surface and every submodule sits under the one package, the extension is
-  `orthon._C`, the checkpoint identifier stays independent of package
-  branding, and the built distribution's metadata is accurate — including the
-  README as its long description, and no author, URL or license claimed that
-  does not exist.
-
-## Continuous integration
-
-`.github/workflows/ci.yml` runs three CPU jobs on `push`, `pull_request` and
-`workflow_dispatch`:
-
-| Job | Runner | Covers |
-| --- | --- | --- |
-| `cpp` | `ubuntu-latest`, `windows-latest` | Configure, build and `ctest` the native suite through the same presets used locally |
-| `python` | `ubuntu-latest`, Python 3.10 and 3.13 | Full Python suite against CPU-only PyTorch |
-| `package` | `ubuntu-latest` | sdist + wheel build, clean-environment install, torch-free runtime smoke |
-
-Python 3.10 is the declared minimum (`requires-python` in `pyproject.toml`);
-3.13 is the current validated upper end.
-
-The Python job installs PyTorch from `https://download.pytorch.org/whl/cpu`.
-torch is a **reference** library for the parity tests, not a runtime
-dependency, and a CPU wheel is what a GPU-less runner can honestly use.
-
-## CUDA and multi-GPU boundary
-
-**There is no CUDA job in CI, deliberately.** GitHub-hosted runners have no
-NVIDIA GPU. A "CUDA" job on one could only compile CPU sources, or build CUDA
-code it can never run — either would report green while proving nothing. No
-permanently-queued self-hosted job has been added either, because no
-self-hosted CUDA runner exists.
-
-CUDA validation is therefore **manual**, in two tiers.
-
-The ongoing local tier is the single-GPU development machine (RTX 4070
-Laptop), re-run on the current tree:
-
-- the full CUDA Python suite (3397 passed / 60 skipped),
-- the CUDA native build,
-- the CUDA native CTest run (191 discovered / 188 passed / 3 skipped),
-- single-GPU device-context and transfer behaviour.
-
-The release validation tier is a one-time run on a Linux machine with two
-A100-SXM4-80GB GPUs (CUDA 12.8, NCCL 2.27.3). It ran the release-candidate
-tree as it stood immediately before the final leaf-gradient-ownership
-correction — a `src/core/tensor.cpp`-only, device-agnostic change that alters
-no computed gradient value and leaves `DeviceGuard`, the peer-copy path, the
-memory pool, the NCCL backend and the DDP transport byte-identical. **The
-post-correction tree has not itself been rerun on two physical GPUs**; it was
-revalidated on the development machine and through the multi-rank local DDP
-backend. Full reasoning:
-[ddp_cloud_validation.md](ddp_cloud_validation.md). Recorded there:
-
-- the full CUDA Python suite — 3426 passed / 20 skipped / 0 failed;
-- the native CUDA CTest run — 186 discovered / 186 passed / 0 skipped;
-- every previously single-GPU-skipped `>=2`-device case executed for real:
-  the three `DeviceGuard` tests, exact `cuda:0`/`cuda:1` placement, cross-GPU
-  `Tensor.to` in both directions, cross-GPU autograd, `map_location` to a
-  second GPU, per-device memory-pool isolation, the NCCL collective and
-  rejection tests, and multi-step DDP in blocking, bucketed and overlap
-  modes.
-
-Both tiers are **correctness** tiers, and the rule that matters is narrow and
-absolute: **no published timing is attributed to the 2x A100-SXM4-80GB
-correctness machine.** Every current performance number — the whole
-Orthon-vs-PyTorch comparison and everything quoted in the README — was
-measured on the RTX 4070 Laptop machine
-([profiles/PYTORCH_COMPARISON.md](../profiles/PYTORCH_COMPARISON.md)).
-[profiles/RESULTS.md](../profiles/RESULTS.md) additionally keeps a small set
-of clearly labelled **historical** rows from an older single A100-SXM4-40GB
-cloud machine, measured against an earlier project state; those are marked as
-history and are not part of any current claim. The 40GB historical benchmark
-machine and the 2x 80GB correctness machine are different systems and are
-never merged.
-
-**What stays outside the final release validation:** the `>=4`- and
-`>=8`-GPU test gates (that machine has two GPUs; an earlier project state has
-a recorded 2/4/8-GPU cloud run, which is historical evidence for an earlier
-tree and is never presented as validation of the 0.1.0 release tree), and any
-permanently repeatable GPU job — the A100 run was one-time, not a runner. On single-GPU machines every `>=2`-device
-case still skips explicitly; nothing fakes a second device. The distributed
-layer's supported-versus-validated contract is in
-[ddp_cloud_validation.md](ddp_cloud_validation.md).
-
-One consequence of that validation now lives in the CPU tier: the DDP
-overlap-mode synchronization state is per-backward, and
-`tests/python/test_distributed_ddp_training.py` contains a multi-step
-local-backend overlap regression (world size 2, `optimizer.zero_grad()`
-between steps, rank-distinct shards) that fails loudly if any backward stops
-launching bucket collectives — GPU-class distributed-correctness coverage
-that runs in the ordinary CPU `python` job.
-
-## Checkpoint format
-
-The on-disk checkpoint/state format, its safety properties and its validation
-are documented separately in
-[`docs/checkpoint_format.md`](checkpoint_format.md). Three test files cover it:
-`tests/python/test_checkpoint_format.py` (container, raw byte codec,
-determinism, corruption, path safety), `tests/python/test_checkpoint.py`
-(model/optimizer round-trips, resume equivalence, `map_location`) and
-`tests/cpp/test_float_formats.cpp` (the native low-precision conversions the
-format's dtype fidelity rests on).
+NCCL tests require the dependencies and hardware described in
+[distributed](distributed.md). Native sanitizer campaigns should report the
+instrumentation, exclusions and tested revision. Checkpoint byte stability is a
+separate contract described in [checkpoint format](checkpoint_format.md).

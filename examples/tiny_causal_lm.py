@@ -1,17 +1,10 @@
-"""Tiny causal language model demo using Orthon.
+"""Train a causal language model on synthetic modular arithmetic sequences.
 
-Synthetic task: next-token prediction on arithmetic progressions mod vocab_size.
-Each training sequence is s, s+d, s+2d, ... mod vocab_size with d in {1, 2, 3}.
-The model learns to predict the next token given the causal context.
-
-Usage:
-    python examples/tiny_causal_lm.py
-    python examples/tiny_causal_lm.py --device cuda --epochs 30
-    python examples/tiny_causal_lm.py --device cuda --epochs 30 \\
-        --embed-dim 32 --num-heads 4 --num-layers 1 --lr 0.001
-"""
+Predict the next token in s, s+d, s+2d, ... modulo vocab_size, for d in {1, 2, 3}.
+Run with --help for model and training options."""
 
 import argparse
+import math
 import time
 
 import numpy as np
@@ -198,8 +191,15 @@ def generate(model, start_tokens, max_new_tokens, device):
     fresh causal mask, samples the argmax at the final position, and appends
     the predicted token to the running context.
     """
-    model.eval()
     context    = list(start_tokens)
+    if not isinstance(max_new_tokens, (int, np.integer)) or max_new_tokens < 0:
+        raise ValueError("max_new_tokens must be a nonnegative integer")
+    if not context and max_new_tokens:
+        raise ValueError("generation requires a nonempty prompt")
+    if any(not isinstance(token, (int, np.integer)) or
+           not 0 <= token < model.vocab_size for token in context):
+        raise ValueError("prompt tokens must be integers in [0, vocab_size)")
+    model.eval()
     block_size = model.block_size
 
     for _ in range(max_new_tokens):
@@ -222,7 +222,7 @@ def generate(model, start_tokens, max_new_tokens, device):
 
 def main():
     parser = argparse.ArgumentParser(description="Tiny causal LM demo (Orthon)")
-    parser.add_argument("--device",          default="cuda")
+    parser.add_argument("--device",          choices=["cpu", "cuda"], default="cuda")
     parser.add_argument("--epochs",          type=int,   default=30)
     parser.add_argument("--batch-size",      type=int,   default=64)
     parser.add_argument("--vocab-size",      type=int,   default=32)
@@ -238,6 +238,31 @@ def main():
     parser.add_argument("--test-size",       type=int,   default=512)
     parser.add_argument("--generate-tokens", type=int,   default=16)
     args = parser.parse_args()
+
+    for name in ("vocab_size", "block_size", "embed_dim", "num_heads",
+                 "batch_size", "train_size", "test_size", "epochs"):
+        if getattr(args, name) <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.num_layers < 0:
+        parser.error("--num-layers must be nonnegative")
+    if args.embed_dim % args.num_heads:
+        parser.error("--embed-dim must be divisible by --num-heads")
+    if args.generate_tokens < 0:
+        parser.error("--generate-tokens must be nonnegative")
+    if not math.isfinite(args.mlp_ratio) or args.mlp_ratio <= 0:
+        parser.error("--mlp-ratio must be finite and positive")
+    try:
+        hidden_dim = int(args.embed_dim * args.mlp_ratio)
+    except (ValueError, OverflowError):
+        parser.error("--mlp-ratio must give a finite positive hidden dimension")
+    if hidden_dim <= 0:
+        parser.error("--mlp-ratio must give a positive hidden dimension")
+    if not math.isfinite(args.dropout) or not 0 <= args.dropout < 1:
+        parser.error("--dropout must be finite and in [0, 1)")
+    if not math.isfinite(args.lr) or args.lr < 0:
+        parser.error("--lr must be finite and nonnegative")
+    if args.seed < 0:
+        parser.error("--seed must be nonnegative")
 
     device = args.device
     if device == "cuda" and not ortho.cuda_enabled():
@@ -286,9 +311,9 @@ def main():
         print(f"{epoch:>5} {tr_loss:>8.4f} {tr_acc:>7.3f} "
               f"{te_loss:>8.4f} {te_acc:>7.3f} {time.time()-t0:>6.2f}s")
 
-    # --- Autoregressive generation demo ---
-    # Prompt is the first 4 tokens of a step-2 progression starting at 3.
-    prompt    = [3, 5, 7, 9]
+    # Autoregressive generation demo
+    # Wrap the step-2 progression into the configured vocabulary.
+    prompt    = [(3 + 2 * k) % args.vocab_size for k in range(4)]
     generated = generate(model, prompt, args.generate_tokens, device)
     expected  = [(3 + 2 * k) % args.vocab_size for k in range(len(generated))]
     print(f"\n--- Autoregressive generation (step-2 progression from {prompt[0]}) ---")

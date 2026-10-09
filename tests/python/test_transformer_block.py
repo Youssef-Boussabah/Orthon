@@ -1,3 +1,4 @@
+from tests.support.capabilities import orthon_cuda_available as _cuda_available
 import numpy as np
 import pytest
 
@@ -5,12 +6,6 @@ import orthon as ortho
 import orthon.nn as nn
 
 
-def _cuda_available():
-    try:
-        ortho.zeros([1]).to("cuda")
-        return True
-    except RuntimeError:
-        return False
 
 
 requires_cuda = pytest.mark.skipif(not _cuda_available(), reason="CUDA not available")

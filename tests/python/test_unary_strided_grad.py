@@ -1,19 +1,5 @@
-"""Unary backward with a non-contiguous upstream gradient.
-
-The ActivationNode/ReluNode family must not assume grad_output is contiguous.
-A node such as TransposeNode hands back a strided view, so a perfectly
-ordinary graph reaches those kernels with a strided gradient, and an
-assumption there produces:
-
-    CPU  -> RuntimeError: <op>_backward: CPU grad_output must be contiguous
-    CUDA -> no error, gradients returned in STORAGE order instead of logical
-            order (measured max abs error up to 5.16 for exp)
-
-The CUDA case is the dangerous one, so these tests assert gradient VALUES and
-their exact logical ordering, never merely that a gradient exists. The upstream
-is deliberately non-uniform: an all-ones upstream is invariant under transpose
-and would make a misordering bug invisible.
-"""
+"""Unary backward preserves logical order for strided, nonuniform upstream gradients."""
+from tests.support.capabilities import orthon_cuda_available
 import numpy as np
 import pytest
 
@@ -21,7 +7,7 @@ import orthon as ortho
 
 torch = pytest.importorskip("torch")
 
-CUDA = ortho.cuda_enabled()
+CUDA = orthon_cuda_available()
 requires_cuda = pytest.mark.skipif(not CUDA, reason="CUDA not available")
 requires_torch_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -84,8 +70,7 @@ def _run(dfn, arr, device, dtype):
     return _npy(z), _npy(x.grad)
 
 
-# ---- the exact missed neg case ----
-
+# the exact missed neg case
 def test_neg_strided_grad_cpu_float32():
     _, got = _run(lambda t: ortho.neg(t), X, "cpu", "float32")
     assert got == pytest.approx(_torch_grad(torch.neg, X, "cpu", torch.float32),
@@ -163,8 +148,7 @@ def test_neg_direct_transpose_form_cpu():
     assert _npy(x.grad) == pytest.approx((-UP.T).ravel(), abs=1e-6)
 
 
-# ---- the whole unary family ----
-
+# the whole unary family
 @pytest.mark.parametrize("name,dfn,tfn,arr", UNARY_OPS, ids=OP_IDS)
 def test_unary_family_strided_grad_cpu_float32(name, dfn, tfn, arr):
     _, got = _run(dfn, arr, "cpu", "float32")
@@ -203,8 +187,7 @@ def test_unary_family_forward_unchanged_by_fix(name, dfn, tfn, arr):
         tfn(tt).detach().numpy().ravel().astype(np.float64), abs=1e-6)
 
 
-# ---- deeper compositions ----
-
+# deeper compositions
 def test_two_unaries_around_a_transpose():
     x = _t(X, "cpu", "float32", rg=True)
     ortho.sum(ortho.neg(ortho.sigmoid(x)).transpose(0, 1).contiguous() * _t(UP)).backward()
@@ -252,8 +235,7 @@ def test_cuda_branched_graph_with_strided_path():
         xt.grad.numpy().ravel().astype(np.float64), abs=1e-4)
 
 
-# ---- The forward graph contract is unaffected ----
-
+# The forward graph contract is unaffected
 def test_no_grad_still_suppresses_graph():
     x = _t(X, rg=True)
     with ortho.no_grad():

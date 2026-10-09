@@ -1,26 +1,7 @@
-"""The training stack injects Python scalars as scalars.
+"""Training helpers use scalar arithmetic instead of data-sized constant tensors.
 
-This file is deliberately half runtime assertion and half SOURCE audit, because
-half the claim is architectural and numerical tests cannot see it.
-
-Building a constant TENSOR by hand to carry a Python number allocates memory
-the size of the data:
-
-    optim/adam.py       full(list(p.shape), 1.0 / bc2)   per parameter, per step
-                        full(list(p.shape), self._eps)   per parameter, per step
-    amp/grad_scaler.py  full(list(loss.shape), scale)
-                        full(list(grad.shape), 1 / scale)
-
-and the same pattern reaches statistic-shaped constants and hand-rolled
-negation helpers in BatchNorm, LayerNorm and attention. The category
-
-    "full parameter/input-shaped tensor used only as a scalar constant"
-
-must stay empty, and `test_full_shaped_scalar_census` is what keeps it empty.
-
-The one full()-built tensor that legitimately stays is GradScaler's [1]-element
-distributed found_inf flag: it is the operand of a collective, not a scalar.
-"""
+The one-element distributed found_inf flag remains a genuine collective operand."""
+from tests.support.capabilities import orthon_cuda_available
 import os
 import re
 
@@ -35,7 +16,7 @@ from orthon.optim import Adam
 
 torch = pytest.importorskip("torch")
 
-CUDA = ortho.cuda_enabled()
+CUDA = orthon_cuda_available()
 requires_cuda = pytest.mark.skipif(not CUDA, reason="CUDA not available")
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -58,10 +39,7 @@ def _strip_py_comments_and_docstrings(text):
     return re.sub(r"#[^\n]*", "", text)
 
 
-# ---------------------------------------------------------------------------
 # Adam allocates no parameter-shaped constants.
-# ---------------------------------------------------------------------------
-
 def test_adam_source_has_no_parameter_shaped_constants():
     body = _strip_py_comments_and_docstrings(_read("python/orthon/optim/adam.py"))
     assert "ortho.full(" not in body, "Adam still builds a constant tensor"
@@ -105,15 +83,16 @@ def test_adam_step_allocates_no_parameter_shaped_constant_at_runtime():
 
 def test_adam_scalar_temporaries_are_rank0():
     """The replacement really is O(1), not a smaller full-shaped tensor."""
+    from tests.support.source import function
+    body = function(_read("src/ops/scalar_ops.cpp"), "scalar_like")
+    assert "full({}, value, reference.dtype(), Device{})" in body
+    assert "reference.shape()" not in body and "reference.numel()" not in body
     p = ortho.full([64, 64], 0.25)
-    assert tuple(ortho._scalar_like(p, 1.0 / 0.999).shape) == ()
-    assert int(ortho._scalar_like(p, 1e-8).numel) == 1
+    assert (p * (1.0 / 0.999)).dtype == p.dtype
+    assert (p + 1e-8).shape == p.shape
 
 
-# ---------------------------------------------------------------------------
 # Adam mathematics is unchanged.
-# ---------------------------------------------------------------------------
-
 def _adam_trajectory(steps=25, lr=0.05, weight_decay=0.0, decay_bias=False):
     """Deterministic, framework-independent trajectory of a single parameter."""
     p = ortho.from_numpy(np.array([1.0, -2.0, 0.5, 3.0], dtype=np.float32))
@@ -199,10 +178,10 @@ def test_adam_state_dict_round_trip_unchanged():
     opt2 = Adam([p2], lr=0.5)
     opt2.load_state_dict(state)
     assert opt2.get_lr() == 0.03
-    assert opt2._t == state["t"]
-    assert opt2._eps == 1e-7
-    assert opt2._weight_decay == 0.1
-    assert opt2._decay_bias is True
+    assert opt2.state_dict()["t"] == state["t"]
+    assert opt2.state_dict()["eps"] == 1e-7
+    assert opt2.state_dict()["weight_decay"] == 0.1
+    assert opt2.state_dict()["decay_bias"] is True
 
 
 @requires_cuda
@@ -228,25 +207,25 @@ def test_adam_moments_stay_on_the_parameter_device():
     p.set_grad(ortho.zeros([3]).to("cuda"))
     opt = Adam([p], lr=0.1)
     opt.step()
-    assert opt._m[0].device == p.device
-    assert opt._v[0].device == p.device
+    assert opt.state_dict()["m"][0].device == p.device
+    assert opt.state_dict()["v"][0].device == p.device
 
 
-# ---------------------------------------------------------------------------
 # GradScaler.
-# ---------------------------------------------------------------------------
-
 def test_grad_scaler_source_uses_scalar_arithmetic():
     body = _strip_py_comments_and_docstrings(
         _read("python/orthon/amp/grad_scaler.py"))
+    transfer = _strip_py_comments_and_docstrings(
+        _read("python/orthon/amp/optimizer.py"))
     assert "return loss * self._scale" in body
-    assert "master.set_grad(master.grad * inv)" in body
-    assert "master.set_grad(fp32_grad * inv)" in body
-    # The ONLY surviving full() is the [1]-element collective flag.
+    assert "_unscale_and_check(1.0 / self._scale)" in body
+    assert "grad = grad * inv_scale" in transfer
+    assert not re.findall(r"ortho\.full\(", transfer)
+    # The only surviving full() is the [1]-element collective flag.
     fulls = re.findall(r"ortho\.full\(([^)]*)\)", body)
     assert fulls == ["[1], 1.0 if self._found_inf else 0.0"], fulls
     # The fused CUDA unscale path is preserved.
-    assert "_amp_unscale_to_float32_and_check" in body
+    assert "_amp_unscale_to_float32_and_check" in transfer
 
 
 def test_grad_scaler_scale_is_numerically_unchanged():
@@ -265,15 +244,7 @@ def test_grad_scaler_scale_is_autograd_safe():
 
 
 def test_grad_scaler_scale_preserves_the_loss_rank():
-    """Deliberate, documented shape change for a RANK-0 loss.
-
-    The old code wrote `shape = list(loss.shape) or [1]`, so scaling a rank-0
-    loss returned shape [1] - the `or [1]` was there because a rank-0 constant
-    was not what the helper was written for, not because the caller wanted a
-    rank-1 result. Scalar arithmetic broadcasts, so the rank is preserved.
-    Every loss the runtime actually produces is unaffected: nll_loss and
-    cross_entropy both return shape (1,).
-    """
+    """Scaling preserves rank-0 losses; no rank-1 constant may change their shape."""
     scaler = GradScaler(init_scale=4.0)
     rank0 = ortho.mean(ortho.full([4], 2.0))
     assert tuple(rank0.shape) == ()
@@ -317,10 +288,7 @@ def test_grad_scaler_scale_keeps_the_exact_device_and_dtype():
         assert np.array(out.tolist()) == pytest.approx([4.0, 8.0], abs=0.05)
 
 
-# ---------------------------------------------------------------------------
 # LayerNorm, BatchNorm, attention.
-# ---------------------------------------------------------------------------
-
 def test_normalization_sources_use_ordinary_arithmetic():
     ln = _strip_py_comments_and_docstrings(_read("python/orthon/nn/layernorm.py"))
     assert "centered = x - mean" in ln
@@ -440,14 +408,11 @@ def test_attention_keeps_the_exact_device():
     assert out.device == q.device
 
 
-# ---------------------------------------------------------------------------
 # the full-shaped scalar census, as an executable rule.
-# ---------------------------------------------------------------------------
-
 RUNTIME_ROOT = "python/orthon"
 
 # Every surviving full()/ones()/zeros()-as-constant call in the runtime, with
-# the reason it is NOT a disguised scalar. Anything not on this list fails.
+# the reason it is not a disguised scalar. Anything not on this list fails.
 ALLOWED_CONSTANT_TENSORS = {
     # rel path                                    justification
     "python/orthon/amp/grad_scaler.py": "collective operand: [1]-element found_inf flag",

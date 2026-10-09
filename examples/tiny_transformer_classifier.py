@@ -1,14 +1,6 @@
-"""Toy Transformer sequence-classification demo using Orthon.
+"""Train a small Transformer classifier on synthetic token sequences.
 
-Synthetic task: vocab_size=32, seq_len=8, num_classes=2.
-Label = 1 if the special_token (7) appears in the sequence, else 0.
-Train/test sets are balanced 50/50 and generated from a fixed NumPy seed.
-
-Usage:
-    python examples/tiny_transformer_classifier.py
-    python examples/tiny_transformer_classifier.py --device cuda
-    python examples/tiny_transformer_classifier.py --epochs 20 --lr 0.001
-"""
+Run with --help for model and training options."""
 
 import argparse
 import time
@@ -140,8 +132,10 @@ def run_epoch(model, optimizer, tokens, labels, batch_size, device, rng, train=T
 
 
 class _noop_ctx:
-    def __enter__(self): return self
-    def __exit__(self, *a): pass
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        pass
 
 
 # Main.

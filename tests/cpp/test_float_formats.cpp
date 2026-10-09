@@ -10,8 +10,8 @@
 #include <orthon/core/dtype.h>
 #include <orthon/core/float_formats.h>
 #include <orthon/core/tensor_impl.h>
-#include <orthon/ops/cpu/cast_ops.h>
-#include <orthon/ops/cpu/fill_ops.h>
+#include <orthon/ops/cast_ops.h>
+#include <orthon/ops/fill_ops.h>
 
 #include <cmath>
 #include <cstdint>
@@ -35,10 +35,7 @@ static uint32_t f32_to_bits(float value) {
     return bits;
 }
 
-// ---------------------------------------------------------------------------
 // float32 -> float16
-// ---------------------------------------------------------------------------
-
 TEST(FloatFormats, F16SignedZero) {
     EXPECT_EQ(f32_to_f16_bits(0.0f), 0x0000u);
     EXPECT_EQ(f32_to_f16_bits(-0.0f), 0x8000u);
@@ -125,10 +122,7 @@ TEST(FloatFormats, F16NaNStaysNaN) {
     EXPECT_NE(negative & 0x03FFu, 0u);
 }
 
-// ---------------------------------------------------------------------------
 // float16 -> float32
-// ---------------------------------------------------------------------------
-
 TEST(FloatFormats, F16DecodeRoundTripsEveryHalf) {
     // Every one of the 65536 half patterns must widen and narrow back to
     // itself: float32 represents all of them exactly.
@@ -154,10 +148,7 @@ TEST(FloatFormats, F16DecodeKnownValues) {
     EXPECT_TRUE(std::isnan(f16_bits_to_f32(0x7E00u)));
 }
 
-// ---------------------------------------------------------------------------
 // float32 -> bfloat16
-// ---------------------------------------------------------------------------
-
 TEST(FloatFormats, BF16SignedZeroAndNormals) {
     EXPECT_EQ(f32_to_bf16_bits(0.0f), 0x0000u);
     EXPECT_EQ(f32_to_bf16_bits(-0.0f), 0x8000u);
@@ -219,10 +210,7 @@ TEST(FloatFormats, BF16DecodeRoundTripsEveryPattern) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The three host entry points must all use these helpers.
-// ---------------------------------------------------------------------------
-
 static uint16_t stored_bits(const Tensor& t) {
     return static_cast<const uint16_t*>(t.data())[0];
 }

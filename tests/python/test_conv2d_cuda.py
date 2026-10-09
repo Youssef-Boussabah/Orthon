@@ -1,5 +1,6 @@
 """CUDA Conv2d forward/backward parity tests."""
 
+from tests.support.capabilities import orthon_cuda_available as _cuda_available
 import pytest
 
 import orthon
@@ -13,14 +14,6 @@ except ImportError:
     HAS_TORCH = False
 
 
-def _cuda_available():
-    if not orthon.cuda_enabled():
-        return False
-    try:
-        orthon.zeros([1]).to("cuda")
-        return True
-    except RuntimeError:
-        return False
 
 
 def _make_values(count, scale=0.05, offset=0):
@@ -702,6 +695,13 @@ def test_conv2d_cuda_backward_basic_matches_torch():
         out_channels=2,
         kernel_size=3,
     )
+    # Consecutive weight/bias reductions reuse shared storage across warps.
+    _assert_cuda_conv2d_backward_matches_torch(
+        input_shape=[2, 1, 6, 6],
+        out_channels=2,
+        kernel_size=3,
+        padding=1,
+    )
 
 
 def test_conv2d_cuda_backward_padding_matches_torch():
@@ -730,3 +730,87 @@ def test_conv2d_cuda_backward_multi_channel_multi_output_matches_torch():
         kernel_size=3,
         padding=1,
     )
+
+
+@pytest.mark.skipif(not (_cuda_available() and HAS_TORCH), reason="CUDA/PyTorch not available")
+@pytest.mark.parametrize("geometry", [
+    (1, 1, 5, 7, 2, 2, 1, 1, 1, 1),
+    (1, 1, 7, 9, 8, 3, 2, 1, 1, 1),
+    (1, 1, 7, 9, 8, 3, 1, 1, 0, 2),
+    (1, 2, 9, 17, 8, 3, 1, 1, 1, 1),
+    (2, 1, 49, 43, 1, 3, 1, 1, 1, 1),
+])
+def test_r1_cuda_v2_direct_and_forced_gradients_match_reference(monkeypatch, geometry):
+    import numpy as np
+    n, ci, h, width, co, k, sh, sw, ph, pw = geometry
+    x_values = np.asarray(_make_values(n * ci * h * width, .04, 19), dtype=np.float32)
+    w_values = np.asarray(_make_values(co * ci * k * k, .03, 23), dtype=np.float32)
+    x = orthon.from_numpy(x_values.reshape(n, ci, h, width)).to("cuda")
+    w = orthon.from_numpy(w_values.reshape(co, ci, k, k)).to("cuda")
+    b = orthon.zeros([co]).to("cuda")
+    y = orthon.conv2d(x, w, b, sh, sw, ph, pw)
+    g_values = np.asarray(_make_values(y.numel, .02, 31), dtype=np.float32).reshape(y.shape)
+    g = orthon.from_numpy(g_values).to("cuda")
+    tx = torch.tensor(x_values, dtype=torch.float64).reshape(x.shape).requires_grad_(True)
+    tw = torch.tensor(w_values, dtype=torch.float64).reshape(w.shape).requires_grad_(True)
+    reference = F.conv2d(tx, tw, stride=(sh, sw), padding=(ph, pw))
+    reference.backward(torch.tensor(g_values, dtype=torch.float64))
+    assert y.shape == tuple(reference.shape)
+    assert y.to("cpu").tolist() == pytest.approx(reference.detach().flatten().tolist(), abs=3e-5, rel=1e-4)
+    for component, expected in [("input", tx.grad), ("weight", tw.grad)]:
+        monkeypatch.setenv("ORTHON_CUDA_CONV2D_GRAD_" + component.upper(), "optimized_v2")
+        for suffix in ["", "_optimized_v2"]:
+            fn = getattr(orthon_c, "_conv2d_cuda_backward_" + component + suffix)
+            actual = fn(x, w, g, sh, sw, ph, pw).to("cpu")
+            assert actual.tolist() == pytest.approx(expected.flatten().tolist(), abs=3e-5, rel=1e-4)
+
+
+@pytest.mark.skipif(not _cuda_available(), reason="CUDA not available")
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+def test_r1_cuda_v2_low_precision_uses_typed_fallback(monkeypatch, dtype):
+    x = orthon.full([1, 1, 5, 7], .25).cast(dtype).to("cuda")
+    w = orthon.full([8, 1, 3, 3], .5).cast(dtype).to("cuda")
+    g = orthon.full([1, 8, 5, 7], .125).cast(dtype).to("cuda")
+    for component in ["input", "weight"]:
+        ordinary = getattr(orthon_c, "_conv2d_cuda_backward_" + component + "_optimized")
+        reference = ordinary(x, w, g, 1, 1, 1, 1).to("cpu").cast("float32").tolist()
+        monkeypatch.setenv("ORTHON_CUDA_CONV2D_GRAD_" + component.upper(), "optimized_v2")
+        for suffix in ["", "_optimized_v2"]:
+            actual = getattr(orthon_c, "_conv2d_cuda_backward_" + component + suffix)(x, w, g, 1, 1, 1, 1)
+            assert actual.dtype == dtype and actual.device == x.device
+            assert actual.to("cpu").cast("float32").tolist() == reference
+
+
+@pytest.mark.skipif(not _cuda_available(), reason="CUDA not available")
+def test_r1_cuda_private_v2_rejects_metadata_before_execution():
+    x = orthon.ones([1, 1, 5, 5]).to("cpu")
+    w = orthon.ones([8, 1, 3, 3]).to("cpu")
+    g = orthon.ones([1, 8, 5, 5]).to("cpu")
+    for component in ["input", "weight"]:
+        fn = getattr(orthon_c, "_conv2d_cuda_backward_" + component + "_optimized_v2")
+        with pytest.raises(ValueError, match="CUDA tensors"):
+            fn(x, w, g, 1, 1, 1, 1)
+        dx, dw, dg = x.to("cuda"), w.to("cuda"), g.to("cuda")
+        with pytest.raises(ValueError, match="dtype"):
+            fn(dx, dw, dg.cast("float16"), 1, 1, 1, 1)
+        with pytest.raises(ValueError, match="shape"):
+            fn(dx, dw, dg.slice(2, 0, 4).contiguous(), 1, 1, 1, 1)
+        with pytest.raises(RuntimeError, match="contiguous"):
+            fn(dx.transpose(2, 3), dw, dg, 1, 1, 1, 1)
+
+
+@pytest.mark.skipif(not _cuda_available(), reason="CUDA not available")
+def test_r1_cuda_v2_ineligible_fallback_completes_in_subprocess():
+    import os
+    import subprocess
+    import sys
+    code = """import orthon as o
+x=o.ones([1,1,5,7]).to('cuda'); w=o.ones([2,1,2,2]).to('cuda'); g=o.ones([1,2,6,8]).to('cuda')
+r=o._C._conv2d_cuda_backward_weight(x,w,g,1,1,1,1).to('cpu')
+assert r.tolist()==[35.0]*8
+print('FALLBACK COMPLETE')
+"""
+    env = dict(os.environ, ORTHON_CUDA_CONV2D_GRAD_WEIGHT="optimized_v2")
+    result = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "FALLBACK COMPLETE"

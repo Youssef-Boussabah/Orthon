@@ -3,7 +3,8 @@ import time as _time
 
 import orthon as _ortho
 
-from ._backend import Backend
+from ._backend import Backend, _TransportFailure
+from ._process_group import _TransportWork
 
 
 _NCCL_INIT_TIMEOUT_SECONDS = 30.0
@@ -38,6 +39,7 @@ class NcclBackend(Backend):
                 f"{_NCCL_FILE_STORE_ENV}"
             )
         self._closed = False
+        self._failure = None
 
         unique_id = self._rendezvous_unique_id()
         self._comm = _ortho._Cmod._nccl_init(
@@ -64,9 +66,14 @@ class NcclBackend(Backend):
         if op != "sum":
             raise NotImplementedError("nccl backend only supports all_reduce op='sum'")
         self._validate_tensor(tensor, "all_reduce")
-        if async_op:
-            return _ortho._Cmod._nccl_all_reduce_sum_async(self._comm, tensor)
-        _ortho._Cmod._nccl_all_reduce_sum(self._comm, tensor)
+        try:
+            work = _TransportWork(_ortho._Cmod._nccl_all_reduce_sum_async(self._comm, tensor), self)
+            if async_op:
+                return work
+            work.wait()
+        except RuntimeError as exc:
+            self._failure = str(exc)
+            raise _TransportFailure(str(exc)) from exc
         return tensor
 
     def broadcast(self, tensor, src=0, async_op=False):
@@ -74,14 +81,23 @@ class NcclBackend(Backend):
         if src < 0 or src >= self._world_size:
             raise ValueError("broadcast src must be in [0, world_size)")
         self._validate_tensor(tensor, "broadcast")
-        if async_op:
-            return _ortho._Cmod._nccl_broadcast_async(self._comm, tensor, int(src))
-        _ortho._Cmod._nccl_broadcast(self._comm, tensor, int(src))
+        try:
+            work = _TransportWork(_ortho._Cmod._nccl_broadcast_async(self._comm, tensor, int(src)), self)
+            if async_op:
+                return work
+            work.wait()
+        except RuntimeError as exc:
+            self._failure = str(exc)
+            raise _TransportFailure(str(exc)) from exc
         return tensor
 
     def barrier(self):
         self._ensure_open()
-        _ortho._Cmod._nccl_barrier(self._comm)
+        try:
+            _ortho._Cmod._nccl_barrier(self._comm)
+        except RuntimeError as exc:
+            self._failure = str(exc)
+            raise _TransportFailure(str(exc)) from exc
         return None
 
     def shutdown(self):
@@ -177,6 +193,12 @@ class NcclBackend(Backend):
     def _ensure_open(self):
         if self._closed:
             raise RuntimeError("nccl distributed backend has been shut down")
+        if self._failure is not None:
+            raise _TransportFailure("nccl distributed backend failed: " + self._failure)
+
+    def _validate_gradient_dtype(self, dtype):
+        if dtype != "float32":
+            raise RuntimeError("NCCL DDP gradient averaging requires float32 gradients")
 
 
 __all__ = ["NcclBackend"]

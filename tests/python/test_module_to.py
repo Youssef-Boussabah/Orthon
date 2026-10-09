@@ -1,4 +1,5 @@
 """Tests for Module.to(device)."""
+from tests.support.capabilities import orthon_cuda_available
 import pytest
 import orthon
 from orthon.nn import Linear, ReLU, Sequential
@@ -7,7 +8,7 @@ from orthon.nn import Linear, ReLU, Sequential
 def requires_cuda(fn):
     """Decorator: skip if CUDA is not compiled in."""
     return pytest.mark.skipif(
-        not orthon.cuda_enabled(),
+        not orthon_cuda_available(),
         reason="CUDA not available"
     )(fn)
 

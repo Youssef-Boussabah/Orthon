@@ -1,5 +1,6 @@
 """CUDA MaxPool2d forward/backward parity tests."""
 
+from tests.support.capabilities import orthon_cuda_available as _cuda_available
 import pytest
 
 import orthon
@@ -12,14 +13,6 @@ except ImportError:
     HAS_TORCH = False
 
 
-def _cuda_available():
-    if not orthon.cuda_enabled():
-        return False
-    try:
-        orthon.zeros([1]).to("cuda")
-        return True
-    except RuntimeError:
-        return False
 
 
 def _unravel_index(flat_index, shape):

@@ -1,4 +1,5 @@
 """End-to-end AMP smoke tests: FP16 + BF16 training loops on CUDA."""
+from tests.support.capabilities import orthon_cuda_available
 import pytest
 import numpy as np
 
@@ -8,7 +9,7 @@ from orthon.nn.module import Module
 from orthon.optim import Adam, SGD
 from orthon.amp import MixedPrecisionOptimizer, GradScaler
 
-CUDA = ortho.cuda_enabled()
+CUDA = orthon_cuda_available()
 
 
 # Tiny model fixture.
@@ -85,14 +86,26 @@ class TestAmpSmokeFp16:
     # Single step.
 
     def test_params_update_after_one_step(self):
-        model, opt, scaler = self._build()
+        # Seed Orthon's initializer as well as NumPy's inputs. A global RNG
+        # history can yield a dead ReLU path with no update to assert.
+        ortho.manual_seed(0)
+        model, opt, scaler = self._build(lr=1e-5)
         x = self._x()
-        before = _param_snapshot(model)
+        owners = list(model.parameters())
+        before = [m.to("cpu").tolist() for m in opt.state_dict()["masters"]]
         opt.zero_grad()
         scaler.scale(_sq_loss(model(x))).backward()
         scaler.step(opt)
         scaler.update()
-        assert _params_changed(before, _param_snapshot(model))
+        masters = opt.state_dict()["masters"]
+        assert any(a != m.to("cpu").tolist() for a, m in zip(before, masters))
+        for parameter, owner, master in zip(model.parameters(), owners, masters):
+            assert parameter is owner and parameter.dtype == self.DTYPE
+            assert parameter.device == master.device and parameter.is_leaf
+            assert parameter.tolist() == ortho.cast(master, self.DTYPE).tolist()
+        # A single master update can be smaller than one FP16 increment.
+        # Accumulation below execution precision is covered by the permanent
+        # small-update master contract, rather than requiring rounding to move.
 
     def test_dtype_fp16_preserved_after_step(self):
         model, opt, scaler = self._build()

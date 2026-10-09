@@ -1,9 +1,9 @@
 _active = None
 
 
-def set_active(backend):
+def set_active(group):
     global _active
-    _active = backend
+    _active = group
 
 
 def get_active():

@@ -2,18 +2,13 @@
 CUDA autograd tests: ReLU backward and reshape backward.
 All CUDA tests are skipped automatically when CUDA is not available.
 """
+from tests.support.capabilities import orthon_cuda_available as _cuda_available
 import pytest
 import orthon as ortho
 
 torch = pytest.importorskip("torch")
 
 
-def _cuda_available():
-    try:
-        ortho.zeros([1]).to("cuda")
-        return True
-    except RuntimeError:
-        return False
 
 
 cuda_available = _cuda_available()

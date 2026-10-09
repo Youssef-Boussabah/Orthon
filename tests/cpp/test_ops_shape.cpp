@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
-#include <orthon/ops/cpu/fill_ops.h>
-#include <orthon/ops/cpu/shape_ops.h>
+#include <orthon/ops/fill_ops.h>
+#include <orthon/ops/shape_ops.h>
 
 // The framework's public API lives in namespace orthon. Tests import it wholesale
 // so the TEST() bodies read as ordinary API usage; TEST() itself must stay at
@@ -61,7 +61,7 @@ TEST(ShapeOps, TransposeIsNotContiguous) {
 // transpose() resolves a negative dim against ndim before range-checking,
 // exactly like Tensor::slice and the reductions' resolve_dim, so
 // `transpose(t, -1, 0)` on a 2-D tensor is the valid call
-// `transpose(t, 1, 0)` and not an error. That normalisation is load-bearing:
+// `transpose(t, 1, 0)` and not an error. Normalize before validating:
 // functional/math.py builds attention scores with `k.transpose(-2, -1)`.
 TEST(ShapeOps, TransposeInvalidDim) {
     auto t = zeros({2, 3});

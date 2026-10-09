@@ -1,15 +1,7 @@
-"""The unified checkpoint container format.
+"""Raw-byte checkpoint integrity, determinism, atomicity and safe decoding.
 
-This file covers the FORMAT itself: raw byte codec, archive layout,
-determinism, atomicity, corruption rejection, path safety and the safe value
-codec. Behavioural round-trips (model/optimizer/resume) live in
-test_checkpoint.py, and dtype conversion lives in test_low_precision.py.
-
-The properties pinned here are the ones a pickle container cannot offer:
-loading never executes what the stream names, tensors are raw bytes rather
-than Python float lists (no ~2.3x inflation, no quieted signalling NaN), and
-dtype is recorded rather than rebuilt as float32.
-"""
+Behavioral model/optimizer round trips live in test_checkpoint.py."""
+from tests.support.capabilities import orthon_cuda_available
 import hashlib
 import io
 import json
@@ -25,16 +17,13 @@ import orthon as ortho
 import orthon.nn as nn
 from orthon.checkpoint import FORMAT_ID, FORMAT_VERSION
 
-CUDA = ortho.cuda_enabled()
+CUDA = orthon_cuda_available()
 requires_cuda = pytest.mark.skipif(not CUDA, reason="CUDA not available")
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
-
 class Holder:
     """Minimal state_dict/load_state_dict duck type for single-tensor cases."""
 
@@ -90,10 +79,7 @@ def _rewrite(source, target, mutate_manifest=None, mutate_entries=None):
     return target
 
 
-# ---------------------------------------------------------------------------
 # the raw tensor byte codec
-# ---------------------------------------------------------------------------
-
 DTYPE_CASES = [
     ("float32", np.array([1.0, -0.0, 0.0, np.inf, -np.inf, np.nan, 1 / 3,
                           3.4028235e38], dtype=np.float32)),
@@ -195,10 +181,7 @@ def test_contiguous_slice_serializes_only_its_own_payload():
     assert ortho._tensor_to_bytes(row) == np.arange(4, 7, dtype=np.float32).tobytes()
 
 
-# ---------------------------------------------------------------------------
 # archive layout and manifest
-# ---------------------------------------------------------------------------
-
 def test_archive_is_a_zip_with_json_manifest_and_binary_payloads(tmp_path):
     path = tmp_path / "state.anything"        # extension is irrelevant
     ortho.save_state_dict(_model(), path)
@@ -280,10 +263,7 @@ def test_state_only_archive_has_no_optimizer_section(tmp_path):
     assert sections["metadata"] == {"k": "dict", "v": []}
 
 
-# ---------------------------------------------------------------------------
 # deterministic archives
-# ---------------------------------------------------------------------------
-
 def _sha(path):
     with open(path, "rb") as handle:
         return hashlib.sha256(handle.read()).hexdigest()
@@ -335,10 +315,7 @@ def test_state_names_are_sorted_in_the_archive(tmp_path):
     assert set(model.state_dict()) == set(names)
 
 
-# ---------------------------------------------------------------------------
 # exact bit round-trips through the file
-# ---------------------------------------------------------------------------
-
 @pytest.mark.parametrize("dtype,array", DTYPE_CASES)
 def test_file_round_trip_is_bit_exact(dtype, array, tmp_path):
     tensor = _from_numpy(array)
@@ -426,10 +403,7 @@ def test_cuda_tensor_serialization(tmp_path):
     assert _raw(on_gpu.tensor) == array.tobytes()
 
 
-# ---------------------------------------------------------------------------
 # saving is observational
-# ---------------------------------------------------------------------------
-
 def test_saving_does_not_mutate_the_source(tmp_path):
     tensor = _from_numpy(np.arange(4, dtype=np.float32))
     tensor.requires_grad_(True)
@@ -475,17 +449,14 @@ def test_state_dict_returns_live_references(tmp_path):
     model = nn.Linear(2, 2)
     state = model.state_dict()
     model.weight.fill_(7.0)
-    assert state["weight"].tolist() == [7.0] * 4      # the SAME tensor
+    assert state["weight"].tolist() == [7.0] * 4      # the same tensor
     assert state["weight"]._impl_id == model.weight._impl_id
     doc = nn.Module.state_dict.__doc__.lower()
     assert "live" in doc
     assert "snapshot" in doc
 
 
-# ---------------------------------------------------------------------------
 # the safe recursive value codec
-# ---------------------------------------------------------------------------
-
 SAFE_VALUES = [
     None, True, False, 0, -17, 2 ** 62, 0.0, -0.5, 1e300,
     "", "text", "unicode \u00e9\u4e2d",
@@ -569,10 +540,7 @@ def test_non_string_dict_keys_rejected(tmp_path):
         ortho.save_checkpoint(tmp_path / "bad.bin", metadata={1: "one"})
 
 
-# ---------------------------------------------------------------------------
 # pickle is gone, and legacy files are refused without unpickling
-# ---------------------------------------------------------------------------
-
 def _strip_py_comments_and_docstrings(text):
     """Remove '#' comments and triple-quoted strings.
 
@@ -653,6 +621,9 @@ def test_checkpoint_serialization_has_no_tolist():
     import orthon.checkpoint as module
     with open(module.__file__, encoding="utf-8") as handle:
         code = _strip_py_comments_and_docstrings(handle.read())
+    from pathlib import Path
+    for source in (Path(module.__file__).parent / "_serialization").glob("*.py"):
+        code += _strip_py_comments_and_docstrings(source.read_text())
     assert ".tolist()" not in code
     assert "set_item" not in code
     assert "_tensor_to_bytes" in code
@@ -695,10 +666,7 @@ def test_detection_ignores_the_file_extension(tmp_path):
         ortho.load_checkpoint(bad)
 
 
-# ---------------------------------------------------------------------------
 # corruption detection
-# ---------------------------------------------------------------------------
-
 @pytest.fixture()
 def sample(tmp_path):
     path = tmp_path / "sample.bin"
@@ -874,10 +842,7 @@ def test_absurd_declared_size_is_rejected_before_allocating(tmp_path, sample):
         ortho.load_checkpoint(path, model=_model())
 
 
-# ---------------------------------------------------------------------------
 # validate before mutating
-# ---------------------------------------------------------------------------
-
 def test_late_corruption_leaves_the_model_untouched(tmp_path):
     """The LAST tensor is corrupted; the FIRST must not have been written."""
     good = tmp_path / "good.bin"
@@ -917,10 +882,7 @@ def test_shape_mismatch_leaves_the_model_untouched(tmp_path):
     assert destination.weight.tolist() == before
 
 
-# ---------------------------------------------------------------------------
 # atomic save
-# ---------------------------------------------------------------------------
-
 def test_failed_save_leaves_the_previous_file_intact(tmp_path):
     path = tmp_path / "keep.bin"
     ortho.save_state_dict(_model(), path)
@@ -948,10 +910,7 @@ def test_save_into_a_missing_directory_is_a_clear_error(tmp_path):
         ortho.save_state_dict(_model(), tmp_path / "nope" / "x.bin")
 
 
-# ---------------------------------------------------------------------------
 # path types
-# ---------------------------------------------------------------------------
-
 def test_str_and_pathlike_are_both_accepted(tmp_path):
     model = _model()
     as_path = tmp_path / "p.bin"
@@ -968,10 +927,7 @@ def test_bad_path_types_raise_type_error(bad, tmp_path):
         ortho.save_state_dict(_model(), bad)
 
 
-# ---------------------------------------------------------------------------
 # structural size proof
-# ---------------------------------------------------------------------------
-
 def test_payload_is_raw_and_the_manifest_stays_small(tmp_path):
     n = 20000
     tensor = _from_numpy(np.arange(n, dtype=np.float32) * 0.5)
@@ -995,10 +951,7 @@ def test_payload_is_raw_and_the_manifest_stays_small(tmp_path):
     assert len(manifest_text) < 512
 
 
-# ---------------------------------------------------------------------------
 # compressed payload rejection
-# ---------------------------------------------------------------------------
-
 def test_compressed_tensor_payload_rejected(tmp_path, sample):
     """v1 tensor payloads are ZIP_STORED; a DEFLATED payload is refused
     before any read, closing the decompression-amplification hole (a tiny

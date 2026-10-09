@@ -1,9 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
-# VERSION is release metadata and must match `version` in pyproject.toml, which
-# is the number the built distribution carries. Two literals that can drift are
-# two chances to ship a wrong one, so
-# tests/python/test_build_architecture.py compares them.
-project(Orthon VERSION 0.1.0 LANGUAGES CXX)
+# CMake requires a numeric VERSION; the full Python release may be a prerelease.
+# tests/python/test_build_architecture.py checks both against pyproject.toml.
+project(Orthon VERSION 1.0.0 LANGUAGES CXX)
+set(ORTHON_RELEASE_VERSION "1.0.0rc1")
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -18,9 +17,17 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # against the tree on disk.
 
 set(ORTHON_CORE_SOURCES
+    src/distributed/work.cpp
+    src/distributed/process_group.cpp
+    src/distributed/nccl_process_group.cpp
+    src/distributed/system_nccl_transport.cpp
     src/autograd/grad_mode.cpp
     src/autograd/grad_utils.cpp
     src/autograd/node.cpp
+    src/autograd/engine.cpp
+    src/core/autograd_meta.cpp
+    src/core/buffer.cpp
+    src/core/layout.cpp
     src/core/dtype.cpp
     src/core/float_formats.cpp
     src/core/memory_pool.cpp
@@ -32,40 +39,82 @@ set(ORTHON_CORE_SOURCES
     src/device/device.cpp
     src/device/device_guard.cpp
     src/memory/allocator.cpp
+    src/memory/allocation.cpp
     src/memory/cpu_allocator.cpp
-    src/ops/cpu/binary_ops.cpp
-    src/ops/cpu/cast_ops.cpp
-    src/ops/cpu/conv2d_ops.cpp
-    src/ops/cpu/cross_entropy_ops.cpp
-    src/ops/cpu/embedding_ops.cpp
-    src/ops/cpu/fill_ops.cpp
-    src/ops/cpu/fusion_ops.cpp
-    src/ops/cpu/index_ops.cpp
-    src/ops/cpu/matmul_ops.cpp
-    src/ops/cpu/maxpool2d_ops.cpp
-    src/ops/cpu/nll_loss_ops.cpp
-    src/ops/cpu/reduce_ops.cpp
-    src/ops/cpu/scalar_ops.cpp
-    src/ops/cpu/shape_ops.cpp
-    src/ops/cpu/slice_ops.cpp
-    src/ops/cpu/softmax_ops.cpp
-    src/ops/cpu/unary_ops.cpp
+    src/memory/cuda_allocator.cpp
+    src/memory/pool.cpp
+    src/memory/raw_allocator.cpp
+    src/memory/scratch.cpp
+    src/dispatch/operator.cpp
+    src/dispatch/kernel_registry.cpp
+    src/dispatch/dispatcher.cpp
+    src/dispatch/builtin_registration.cpp
+    src/diagnostics/matmul.cpp
+    src/planning/matmul_planner.cpp
+    src/runtime/runtime.cpp
+    src/runtime/cpu_context.cpp
+    src/runtime/cuda_context.cpp
+    src/runtime/cuda_stream.cpp
+    src/runtime/completion.cpp
+    src/backends/cpu/binary.cpp
+    src/backends/cpu/cast.cpp
+    src/backends/cpu/conv2d.cpp
+    src/backends/cpu/copy.cpp
+    src/backends/cpu/cross_entropy.cpp
+    src/backends/cpu/embedding.cpp
+    src/backends/cpu/fill.cpp
+    src/backends/cpu/fusion.cpp
+    src/backends/cpu/index.cpp
+    src/backends/cpu/matmul.cpp
+    src/backends/cpu/max_backward.cpp
+    src/backends/cpu/maxpool2d.cpp
+    src/backends/cpu/nll_loss.cpp
+    src/backends/cpu/reduce.cpp
+    src/backends/cpu/slice.cpp
+    src/backends/cpu/softmax.cpp
+    src/backends/cpu/tensor_access.cpp
+    src/backends/cpu/unary.cpp
+    src/backends/cpu/unbroadcast.cpp
+    src/core/execution_copy.cpp
+    src/core/host_copy.cpp
+    src/core/broadcast.cpp
+    src/ops/backward_ops.cpp
+    src/ops/tensor_access.cpp
+    src/ops/binary_ops.cpp
+    src/ops/cast_ops.cpp
+    src/ops/conv2d_ops.cpp
+    src/ops/cross_entropy_ops.cpp
+    src/ops/embedding_ops.cpp
+    src/ops/fill_ops.cpp
+    src/ops/fusion_ops.cpp
+    src/ops/index_ops.cpp
+    src/ops/matmul_ops.cpp
+    src/ops/maxpool2d_ops.cpp
+    src/ops/nll_loss_ops.cpp
+    src/reduction/reduction.cpp
+    src/ops/reduce_ops.cpp
+    src/ops/scalar_ops.cpp
+    src/ops/shape_ops.cpp
+    src/ops/slice_ops.cpp
+    src/ops/softmax_ops.cpp
+    src/ops/unary_ops.cpp
     src/utils/logging.cpp
 )
 
 set(ORTHON_CUDA_SOURCES
-    src/ops/cuda/binary_kernels.cu
-    src/ops/cuda/cast_kernels.cu
-    src/ops/cuda/conv2d_cuda.cu
-    src/ops/cuda/cross_entropy_kernels.cu
-    src/ops/cuda/embedding_kernels.cu
-    src/ops/cuda/fusion_kernels.cu
-    src/ops/cuda/matmul_kernels.cu
-    src/ops/cuda/maxpool2d_kernels.cu
-    src/ops/cuda/nll_loss_kernels.cu
-    src/ops/cuda/reduce_kernels.cu
-    src/ops/cuda/softmax_kernels.cu
-    src/ops/cuda/unary_kernels.cu
+    src/backends/cuda/adapters.cpp
+    src/backends/cuda/binary_kernels.cu
+    src/backends/cuda/cast_kernels.cu
+    src/backends/cuda/conv2d_cuda.cu
+    src/backends/cuda/cross_entropy_kernels.cu
+    src/backends/cuda/embedding_kernels.cu
+    src/backends/cuda/fusion_kernels.cu
+    src/backends/cuda/matmul_kernels.cu
+    src/backends/cuda/maxpool2d_kernels.cu
+    src/backends/cuda/nll_loss_kernels.cu
+    src/backends/cuda/reduce_kernels.cu
+    src/backends/cuda/softmax_kernels.cu
+    src/backends/cuda/unary_kernels.cu
 )
 
 foreach(_src IN LISTS ORTHON_CORE_SOURCES ORTHON_CUDA_SOURCES)
@@ -151,7 +200,7 @@ if(_ORTHON_CUDA_ENABLED)
     # Deliberately NOT hard-coded to one SM: which architecture a build should
     # target belongs to whoever is building, not to this file. Override on the
     # command line or in a preset, e.g.
-    #     -DCMAKE_CUDA_ARCHITECTURES=native      (CMake 3.24+, this machine's GPUs)
+    #     -DCMAKE_CUDA_ARCHITECTURES=native      (CMake 3.24+, visible GPU architectures)
     #     -DCMAKE_CUDA_ARCHITECTURES="80;86;89"  (a portable fat binary)
     # The 3.16 floor still configures: the policy simply does not exist there,
     # and the pre-3.18 behaviour is unchanged.
@@ -259,12 +308,7 @@ include(CTest)
 option(ORTHON_FETCH_GTEST
        "Download a pinned GoogleTest when no compatible one is installed" ON)
 
-# Pinned to an immutable COMMIT, not a tag. A tag is a movable reference: an
-# upstream retag would silently change what this build downloads, and nothing
-# here would notice. The commit below is what refs/tags/v1.18.0 resolves to,
-# verified against https://github.com/google/googletest. v1.18.0 is a stable
-# release; it requires C++17 (this project already sets CMAKE_CXX_STANDARD 17)
-# and declares cmake_minimum_required 3.16/3.13, both satisfied here.
+# Pin the dependency commit so upstream tag changes cannot alter builds.
 set(ORTHON_GTEST_VERSION "v1.18.0" CACHE STRING
     "Human-readable GoogleTest release matching ORTHON_GTEST_COMMIT")
 set(ORTHON_GTEST_COMMIT "063de7e9578f82b369302001269680b4b1553359" CACHE STRING
@@ -338,41 +382,89 @@ if(BUILD_TESTING)
         set(_orthon_discovery DISCOVERY_MODE PRE_TEST)
     endif()
 
-    function(orthon_add_cpp_test target source)
+    function(orthon_add_cpp_test target source domain)
         add_executable(${target} ${source})
         target_link_libraries(${target} PRIVATE orthon GTest::gtest GTest::gtest_main)
         gtest_discover_tests(${target}
             ${_orthon_discovery}
             DISCOVERY_TIMEOUT 60
-            PROPERTIES TIMEOUT 300
+            PROPERTIES TIMEOUT 300 LABELS "native;${domain}"
         )
     endfunction()
 
-    # Every source stays its own executable. Merging them would shrink the
-    # target list at the cost of losing per-area isolation, so it is not done.
-    set(ORTHON_CPP_TESTS
+    # One source per executable, one discovered case per TEST(). Each target
+    # belongs to one explicit primary domain; additions require registry review.
+    set(ORTHON_TEST_DOMAINS
+        core runtime operators autograd distributed compatibility
+    )
+    set(ORTHON_TESTS_CORE
         test_tensor
-        test_ops_binary
-        test_ops_shape
-        test_ops_reduce
-        test_ops_unary
-        test_ops_to
-        test_ops_matmul
-        test_indexing
-        test_device_guard
-        test_ops_scalar
+        test_tensor_core
         test_float_formats
         test_identity
     )
+    set(ORTHON_TESTS_RUNTIME
+        test_allocator
+        test_runtime_context
+        test_async_runtime
+        test_device_guard
+        test_dispatcher
+        test_async_cuda
+    )
+    set(ORTHON_TESTS_OPERATORS
+        test_backends
+        test_ops_binary
+        test_ops_shape
+        test_ops_reduce
+        test_reduction_subsystem
+        test_ops_unary
+        test_ops_to
+        test_matmul_planner
+        test_ops_matmul
+        test_indexing
+        test_ops_scalar
+    )
+    set(ORTHON_TESTS_AUTOGRAD
+        test_autograd_engine
+    )
+    set(ORTHON_TESTS_DISTRIBUTED
+        test_distributed_runtime
+        test_distributed_cuda
+    )
+    set(ORTHON_TESTS_COMPATIBILITY
+        test_compatibility_surface
+    )
 
-    foreach(_t IN LISTS ORTHON_CPP_TESTS)
-        if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpp/${_t}.cpp")
-            message(FATAL_ERROR
-                "Native test source tests/cpp/${_t}.cpp is missing; refusing "
-                "to configure a partial C++ suite.")
-        endif()
-        orthon_add_cpp_test(${_t} tests/cpp/${_t}.cpp)
+    set(ORTHON_NATIVE_TESTS)
+    set(ORTHON_CPP_TESTS)
+    foreach(_orthon_domain IN LISTS ORTHON_TEST_DOMAINS)
+        string(TOUPPER "${_orthon_domain}" _orthon_domain_upper)
+        foreach(_t IN LISTS ORTHON_TESTS_${_orthon_domain_upper})
+            if(_t IN_LIST ORTHON_NATIVE_TESTS)
+                message(FATAL_ERROR "Native target ${_t} has multiple primary domains")
+            endif()
+            list(APPEND ORTHON_NATIVE_TESTS ${_t})
+            # The explicitly named CUDA source is registered only below.
+            if(_t STREQUAL "test_async_cuda")
+                continue()
+            endif()
+            list(APPEND ORTHON_CPP_TESTS ${_t})
+            if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpp/${_t}.cpp")
+                message(FATAL_ERROR
+                    "Native test source tests/cpp/${_t}.cpp is missing; refusing "
+                    "to configure a partial C++ suite.")
+            endif()
+            orthon_add_cpp_test(${_t} tests/cpp/${_t}.cpp ${_orthon_domain})
+        endforeach()
     endforeach()
+
+    if(_ORTHON_CUDA_ENABLED)
+        if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpp/test_async_cuda.cu")
+            message(FATAL_ERROR "Native CUDA async test source is missing")
+        endif()
+        orthon_add_cpp_test(test_async_cuda tests/cpp/test_async_cuda.cu runtime)
+        set_target_properties(test_async_cuda PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+    endif()
 
     # BUILD_TESTING=ON plus a successful configure means native tests exist.
     # This catches the list itself being emptied.
@@ -425,10 +517,15 @@ if(BUILD_PYTHON_BINDINGS)
             LIBRARY_OUTPUT_DIRECTORY "$<1:${CMAKE_BINARY_DIR}/orthon>"
             RUNTIME_OUTPUT_DIRECTORY "$<1:${CMAKE_BINARY_DIR}/orthon>"
         )
-        configure_file(
-            "${CMAKE_SOURCE_DIR}/python/orthon/__init__.py"
-            "${CMAKE_BINARY_DIR}/orthon/__init__.py"
-            COPYONLY
+        # Run at build time so Python edits and new modules reach the stage
+        # without reconfiguration. Copy only sources; leave _C untouched.
+        add_custom_target(orthon_python_sources ALL
+            COMMAND "${CMAKE_COMMAND}"
+                "-DORTHON_PYTHON_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/python/orthon"
+                "-DORTHON_PYTHON_STAGE_DIR=${CMAKE_BINARY_DIR}/orthon"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/stage_python.cmake"
+            VERBATIM
         )
+        add_dependencies(_C orthon_python_sources)
     endif()
 endif()

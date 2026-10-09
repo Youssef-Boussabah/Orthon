@@ -1,24 +1,7 @@
-"""Integer-index view autograd.
+"""Integer-index views scatter gradients into the selected parent block.
 
-``Tensor::operator[]`` returns a storage-sharing view that is also graph-
-connected. A view that carried no graph metadata would silently sever the
-graph::
-
-    x.requires_grad_(True)
-    y = x[1]            # y.requires_grad == False, no grad_fn
-
-so the loss built from ``y`` would not even require grad, and
-``loss.backward()`` would raise "tensor does not require grad".
-
-``x[i]`` is a view sharing storage with ``x``, with the same shape, strides and
-storage offset; its backward scatters the gradient into first-dimension block
-``i`` of a zero tensor shaped like the parent.
-
-Every gradient assertion compares VALUES against PyTorch and separately pins
-the untouched regions to exactly zero: a scatter that writes the right numbers
-into the wrong block is the failure mode worth guarding against, and an
-all-ones upstream would hide it.
-"""
+Compare nonuniform values and untouched zero regions to detect misplaced writes."""
+from tests.support.capabilities import orthon_cuda_available
 import numpy as np
 import pytest
 
@@ -26,7 +9,7 @@ import orthon as ortho
 
 torch = pytest.importorskip("torch")
 
-CUDA = ortho.cuda_enabled()
+CUDA = orthon_cuda_available()
 DEVICES = ["cpu"] + (["cuda"] if CUDA else [])
 requires_cuda = pytest.mark.skipif(not CUDA, reason="CUDA not available")
 
@@ -72,10 +55,7 @@ def _ref(t):
     return t.grad.double().numpy().ravel()
 
 
-# --------------------------------------------------------------------------
 # Forward view contract - unchanged by autograd attachment
-# --------------------------------------------------------------------------
-
 @pytest.mark.parametrize("dev", DEVICES)
 def test_index_is_still_a_view_when_grad_is_tracked(dev):
     x = _d(X34, dev)
@@ -116,10 +96,7 @@ def test_scalar_index_view_is_zero_dimensional(dev):
     assert s.storage_offset == 6
 
 
-# --------------------------------------------------------------------------
 # Graph metadata
-# --------------------------------------------------------------------------
-
 @pytest.mark.parametrize("dev", DEVICES)
 def test_index_attaches_grad_fn_when_parent_requires_grad(dev):
     x = _d(X34, dev)
@@ -166,10 +143,7 @@ def test_global_grad_disabled_index_returns_a_detached_view(dev):
     assert y.storage_offset == 4
 
 
-# --------------------------------------------------------------------------
 # Basic parity: positive, negative, every index
-# --------------------------------------------------------------------------
-
 @pytest.mark.parametrize("dev", DEVICES)
 @pytest.mark.parametrize("i", [0, 1, 2, -1, -2, -3])
 def test_row_index_gradient_matches_torch(dev, i):
@@ -223,10 +197,7 @@ def test_non_scalar_backward_seed_through_index(dev):
     assert _np(x.grad) == pytest.approx(_ref(xt), abs=1e-6)
 
 
-# --------------------------------------------------------------------------
 # Scalar indexing
-# --------------------------------------------------------------------------
-
 @pytest.mark.parametrize("dev", DEVICES)
 def test_scalar_index_of_1d_backward(dev):
     x = _d(X5, dev)
@@ -256,16 +227,13 @@ def test_scalar_index_of_2d_backward(dev, form):
     assert _np(x.grad).reshape(3, 4) == pytest.approx(expected, abs=0)
 
 
-# --------------------------------------------------------------------------
 # Chained tuple / list indexing (existing binding semantics)
-# --------------------------------------------------------------------------
-
 @pytest.mark.parametrize("dev", DEVICES)
 @pytest.mark.parametrize("key", ["tuple", "paren_tuple", "list", "chained"])
 def test_all_chained_index_forms_produce_the_same_gradient(dev, key):
     """The binding implements tuple/list keys as repeated cur = cur[i], so all
     four spellings must give the same graph. NOTE: x[[1, 2]] is chained
-    indexing here (== x[1][2]), NOT PyTorch advanced indexing (which would
+    indexing here (== x[1][2]), not PyTorch advanced indexing (which would
     gather rows 1 and 2). The torch reference is therefore written as the
     chained form the binding actually implements."""
     x = _d(X34, dev)
@@ -316,10 +284,7 @@ def test_chained_index_into_3d(dev):
     assert np.count_nonzero(g) == np.count_nonzero(UP4)
 
 
-# --------------------------------------------------------------------------
 # Composition: non-contiguous parent, strided grad_output
-# --------------------------------------------------------------------------
-
 @pytest.mark.parametrize("dev", DEVICES)
 def test_index_a_non_contiguous_parent(dev):
     """IndexNode -> TransposeNode -> x.
@@ -376,10 +341,7 @@ def test_index_of_a_computed_non_leaf_parent(dev):
     assert _np(x.grad) == pytest.approx(_ref(xt), abs=1e-6)
 
 
-# --------------------------------------------------------------------------
 # Branched / repeated indexing (exercises central gradient accumulation)
-# --------------------------------------------------------------------------
-
 @pytest.mark.parametrize("dev", DEVICES)
 def test_same_index_twice_accumulates(dev):
     x = _d(X34, dev)
@@ -434,10 +396,7 @@ def test_index_gradient_accumulates_across_backward_calls(dev):
     assert not np.allclose(first, second)
 
 
-# --------------------------------------------------------------------------
 # Gradient object properties
-# --------------------------------------------------------------------------
-
 @pytest.mark.parametrize("dev", DEVICES)
 def test_index_gradient_carries_no_graph(dev):
     x = _d(X34, dev)
@@ -460,10 +419,7 @@ def test_index_gradient_preserves_dtype_and_exact_device(dev):
     assert x.grad.device == x.device
 
 
-# --------------------------------------------------------------------------
 # DTypes
-# --------------------------------------------------------------------------
-
 def test_cpu_float64_index_gradient():
     x = ortho.from_numpy(np.ascontiguousarray(X34.astype(np.float64)))
     x.requires_grad_(True)
@@ -508,10 +464,7 @@ def test_cuda_half_scatter_preserves_bytes_outside_the_block(dtype):
     assert np.count_nonzero(g[1]) == 4
 
 
-# --------------------------------------------------------------------------
 # Existing forward behaviour must be unchanged
-# --------------------------------------------------------------------------
-
 def test_out_of_range_still_raises():
     x = _d(X34)
     x.requires_grad_(True)
@@ -558,10 +511,7 @@ def test_setitem_semantics_are_untouched():
     assert [x.get_item([2, j]) for j in range(4)] == [3.0] * 4
 
 
-# --------------------------------------------------------------------------
 # Block-shape handling and the CUDA device-context contract
-# --------------------------------------------------------------------------
-
 X324 = _vals((3, 2, 4), 0.7)
 UP24 = _vals((2, 4), 1.5, 0.9)
 
@@ -588,7 +538,7 @@ def _index_ops_source():
     """The native scatter source, or None when running outside the repo."""
     import os
     path = os.path.join(os.path.dirname(__file__), "..", "..",
-                        "src", "ops", "cpu", "index_ops.cpp")
+                        "src", "backends", "cuda", "adapters.cpp")
     if not os.path.isfile(path):
         return None
     with open(path, encoding="utf-8") as f:
@@ -599,25 +549,19 @@ def _cuda_branch():
     src = _index_ops_source()
     if src is None:
         pytest.skip("native source not available next to the test tree")
-    start = src.index("#ifdef WITH_CUDA", src.index("Tensor index_backward"))
-    return src[start:src.index("#else", start)]
+    start = src.index("Tensor cuda_index_backward_adapter")
+    return src[start:src.index("Tensor cuda_slice_backward_adapter", start)]
 
 
 def test_cuda_scatter_selects_the_parent_device():
-    """Source-level regression guard.
+    """CUDA scatter selects the parent Device before touching its memory.
 
-    The single-GPU machine this runs on cannot exercise the multi-device case,
-    so pin the call instead: the CUDA branch must select the parent's device
-    before touching its memory, because memory_pool_allocate() only selects a
-    device when it falls through to a raw cudaMalloc. The selection is the
-    engine-wide RAII DeviceGuard, which also restores the caller's device -
-    never a raw cudaSetDevice.
-    """
+    Pool reuse must not bypass the DeviceGuard that restores the caller's device."""
     branch = _cuda_branch()
     assert "DeviceGuard guard(input_device)" in branch
     # ...and it must come before the memory operations it protects.
-    assert branch.index("DeviceGuard guard(") < branch.index("cudaMemset")
-    assert branch.index("DeviceGuard guard(") < branch.index("cudaMemcpy")
+    assert branch.index("DeviceGuard guard(") < branch.index("context->memset_async")
+    assert branch.index("DeviceGuard guard(") < branch.index("context->copy_d2d_async")
     # The raw setter it replaced must not have come back.
     assert "cudaSetDevice" not in branch.replace(
         "raw cudaSetDevice because no", "")

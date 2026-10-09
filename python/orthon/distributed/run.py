@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 
 
 def _parse_args(argv):
@@ -56,10 +57,12 @@ def launch(argv=None):
             processes.append((rank, process))
 
         failures = []
-        for rank, process in processes:
-            returncode = process.wait()
-            if returncode != 0:
-                failures.append((rank, returncode))
+        while True:
+            failures = [(rank, p.returncode) for rank, p in processes
+                        if p.poll() not in (None, 0)]
+            if failures or all(p.poll() is not None for _, p in processes):
+                break
+            time.sleep(0.05)
         if failures:
             details = ", ".join(
                 f"rank {rank} exited with {code}" for rank, code in failures
@@ -73,7 +76,11 @@ def launch(argv=None):
                 process.terminate()
         for _, process in processes:
             if process.poll() is None:
-                process.wait()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=2)
         if store_context is not None:
             store_context.__exit__(None, None, None)
 

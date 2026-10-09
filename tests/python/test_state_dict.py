@@ -1,7 +1,7 @@
 """Tests for Module.state_dict / load_state_dict and file save/load.
 
 The file round-trips below go through the unified pickle-free archive.
-Detection never looks at the extension, and the assertions are on EXACT bytes:
+Detection never looks at the extension, and the assertions are on exact bytes:
 with a raw-byte codec there is no reason for a saved value to come back merely
 close to what was written.
 """

@@ -3,6 +3,7 @@
 Buffer behaviour is proven with small synthetic modules rather than BatchNorm,
 so these tests stay valid independently of how BatchNorm is later migrated.
 """
+from tests.support.capabilities import orthon_cuda_available
 import numpy as np
 import pytest
 
@@ -10,7 +11,7 @@ import orthon as ortho
 from orthon.nn import Conv2d, Embedding, LayerNorm, Linear, Sequential
 from orthon.nn.module import Module, Parameter
 
-CUDA = ortho.cuda_enabled()
+CUDA = orthon_cuda_available()
 requires_cuda = pytest.mark.skipif(not CUDA, reason="CUDA not available")
 
 
@@ -151,7 +152,15 @@ def test_optimizer_traversal_sees_only_parameters():
     from orthon.optim import SGD
     m = Nest()
     opt = SGD(m.parameters(), lr=0.1)
-    assert len(opt._params) == 1
+    assert len(list(m.parameters())) == 1
+    before = {name: value.tolist() for name, value in m.named_buffers()}
+    for value in list(m.parameters()) + list(m.buffers()):
+        value.set_grad(ortho.ones(list(value.shape), dtype=value.dtype))
+    opt.step()
+    assert {name: value.tolist() for name, value in m.named_buffers()} == before
+    opt.zero_grad()
+    assert all(p.grad is None for p in m.parameters())
+    assert all(value.grad is not None for value in m.buffers())
 
 
 # 8-10. state_dict.

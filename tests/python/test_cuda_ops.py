@@ -4,16 +4,12 @@ CUDA kernel tests: add and relu.
 CUDA tests are skipped automatically when CUDA is not available.
 CPU tests at the bottom verify the existing paths are untouched.
 """
+import orthon._diagnostics as diag
+from tests.support.capabilities import orthon_cuda_available as _cuda_available
 import pytest
 import numpy as np
 import orthon as ortho
 
-def _cuda_available():
-    try:
-        ortho.zeros([1]).to("cuda")
-        return True
-    except RuntimeError:
-        return False
 
 
 cuda_available = _cuda_available()
@@ -945,9 +941,9 @@ def test_matmul_diagnostics_reject_invalid_rank():
     a1 = ortho.ones([4]).to("cuda")          # 1-D: previously undefined behavior
     b  = ortho.ones([4, 4]).to("cuda")
     with pytest.raises(RuntimeError, match="2-D"):
-        ortho._matmul_naive(a1, b)
+        diag.matmul_naive(a1, b)
     with pytest.raises(RuntimeError, match="2-D"):
-        ortho._matmul_tiled(a1, b)
+        diag.matmul_custom(a1, b)
 
 
 @requires_cuda
@@ -955,9 +951,9 @@ def test_matmul_diagnostics_reject_cpu_operands():
     a_cpu = ortho.ones([4, 4])
     b_gpu = ortho.ones([4, 4]).to("cuda")
     with pytest.raises(RuntimeError, match="CUDA"):
-        ortho._matmul_naive(a_cpu, b_gpu)
+        diag.matmul_naive(a_cpu, b_gpu)
     with pytest.raises(RuntimeError, match="CUDA"):
-        ortho._matmul_tiled(a_cpu, b_gpu)
+        diag.matmul_custom(a_cpu, b_gpu)
 
 
 @requires_cuda
@@ -965,15 +961,15 @@ def test_matmul_diagnostics_reject_inner_dim_mismatch():
     a = ortho.ones([4, 3]).to("cuda")
     b = ortho.ones([4, 4]).to("cuda")
     with pytest.raises(RuntimeError, match="inner dimensions"):
-        ortho._matmul_naive(a, b)
+        diag.matmul_naive(a, b)
 
 
 @requires_cuda
 def test_matmul_diagnostics_valid_call_still_works():
     a = ortho.ones([4, 5]).to("cuda")
     b = ortho.ones([5, 6]).to("cuda")
-    out = ortho._matmul_naive(a, b)
+    out = diag.matmul_naive(a, b)
     assert tuple(out.shape) == (4, 6)
     assert out.to("cpu").tolist() == [5.0] * 24
-    out_t = ortho._matmul_tiled(a, b)
+    out_t = diag.matmul_custom(a, b)
     assert out_t.to("cpu").tolist() == [5.0] * 24

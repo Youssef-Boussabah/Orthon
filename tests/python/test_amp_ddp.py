@@ -1,3 +1,4 @@
+from tests.support.capabilities import orthon_cuda_available as _cuda_available
 import pytest
 
 import orthon as ortho
@@ -8,12 +9,6 @@ from orthon.nn import Linear
 from orthon.optim import SGD
 
 
-def _cuda_available():
-    try:
-        ortho.zeros([1]).to("cuda")
-        return True
-    except RuntimeError:
-        return False
 
 
 requires_cuda = pytest.mark.skipif(not _cuda_available(), reason="CUDA not available")

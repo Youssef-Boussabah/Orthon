@@ -3,11 +3,9 @@ import time as _time
 import traceback as _traceback
 
 import numpy as _np
-
 from . import _state
-from ._backend import Backend
+from ._backend import Backend, _TransportFailure
 from .work import _CompletedWork
-
 
 _COLLECTIVE_TIMEOUT_SECONDS = 30.0
 
@@ -20,12 +18,15 @@ class LocalBackend(Backend):
             raise ValueError("rank must be in [0, world_size)")
         if store is None:
             raise ValueError("local backend requires a shared multiprocessing store")
-        self._rank = int(rank)
-        self._world_size = int(world_size)
-        self._condition = store["condition"]
-        self._values = store["values"]
-        self._sequence = 0
-        self._closed = False
+        self._rank, self._world_size = int(rank), int(world_size)
+        self._condition, self._values = store["condition"], store["values"]
+        self._sequence, self._closed, self._failure = 0, False, None
+        # Every rank advances its own generation. Old collective departure
+        # cannot delete a newly initialized group's sequence-zero completion.
+        with self._condition:
+            key = f"generation:{rank}"
+            self._generation = int(self._values.get(key, -1)) + 1
+            self._values[key] = self._generation
 
     @property
     def rank(self):
@@ -35,123 +36,92 @@ class LocalBackend(Backend):
     def world_size(self):
         return self._world_size
 
+    def _ensure_open(self):
+        if self._closed:
+            raise RuntimeError("local distributed backend has been shut down")
+        if self._failure is not None:
+            raise _TransportFailure("local distributed backend failed: " + self._failure)
+
+    def _validate_tensor(self, tensor, reduction=False):
+        if not tensor.is_contiguous:
+            raise RuntimeError("local collectives require contiguous tensors")
+        supported = {"float32", "float64", "float16", "int32", "int64", "uint8", "int8"}
+        if not reduction:
+            supported.add("bool")
+        if tensor.dtype not in supported:
+            raise RuntimeError(f"local collective does not support dtype {tensor.dtype}")
+
     def all_reduce(self, tensor, op="sum", async_op=False):
         self._ensure_open()
         if op != "sum":
             raise NotImplementedError("local backend only supports all_reduce op='sum'")
-        tag = self._next_tag("all_reduce")
-        payload = _tensor_to_payload(tensor)
-        result = self._collect_payloads(tag, payload, _sum_payloads)
+        self._validate_tensor(tensor, reduction=True)
+        descriptor = ("all_reduce", tuple(tensor.shape), tensor.dtype, None)
+        result = self._exchange(descriptor, _tensor_to_payload(tensor))
         _copy_payload_into_tensor(result, tensor)
-        if async_op:
-            return _CompletedWork()
-        return tensor
+        return _CompletedWork() if async_op else tensor
 
     def broadcast(self, tensor, src=0, async_op=False):
         self._ensure_open()
         if src < 0 or src >= self._world_size:
             raise ValueError("broadcast src must be in [0, world_size)")
-        tag = self._next_tag("broadcast")
-        payload = _tensor_to_payload(tensor) if self._rank == src else None
-        result = self._broadcast_payload(tag, payload, src)
+        self._validate_tensor(tensor)
+        descriptor = ("broadcast", tuple(tensor.shape), tensor.dtype, src)
+        result = self._exchange(descriptor, _tensor_to_payload(tensor) if self.rank == src else None)
         _copy_payload_into_tensor(result, tensor)
-        if async_op:
-            return _CompletedWork()
-        return tensor
+        return _CompletedWork() if async_op else tensor
 
     def barrier(self):
         self._ensure_open()
-        tag = self._next_tag("barrier")
-        self._barrier(tag)
-        return None
+        self._exchange(("barrier", (), None, None), None)
 
     def shutdown(self):
         self._closed = True
-        return None
 
-    def _ensure_open(self):
-        if self._closed:
-            raise RuntimeError("local distributed backend has been shut down")
-
-    def _next_tag(self, kind):
-        tag = f"{kind}:{self._sequence}"
+    def _exchange(self, descriptor, payload):
+        prefix = f"group:{self._generation}"
+        tag = f"{prefix}:{self._sequence}"
         self._sequence += 1
-        return tag
-
-    def _collect_payloads(self, tag, payload, reducer):
-        result_key = f"{tag}:result"
-        values_key = f"{tag}:values"
-        leave_key = f"{tag}:leave"
-
+        entries_key, result_key, leave_key = (tag + suffix for suffix in (":entries", ":result", ":leave"))
+        abort_key = prefix + ":abort"
         with self._condition:
-            entries = dict(self._values.get(values_key, {}))
-            entries[self._rank] = payload
-            self._values[values_key] = entries
-            if len(entries) == self._world_size:
-                self._values[result_key] = reducer(
-                    [entries[idx] for idx in range(self._world_size)]
-                )
+            entries = dict(self._values.get(entries_key, {}))
+            entries[self.rank] = (descriptor, payload)
+            self._values[entries_key] = entries
+            if len(entries) == self.world_size:
+                try:
+                    ordered = [entries[r] for r in range(self.world_size)]
+                    if any(d != descriptor for d, _ in ordered):
+                        raise RuntimeError(f"local collective mismatch at sequence {self._sequence - 1}: "
+                                           f"{[d for d, _ in ordered]}")
+                    kind, _, _, src = descriptor
+                    result = (_sum_payloads([p for _, p in ordered]) if kind == "all_reduce" else
+                              ordered[src][1] if kind == "broadcast" else None)
+                    self._values[result_key] = result
+                except Exception as exc:
+                    self._values[abort_key] = str(exc)
                 self._condition.notify_all()
-            else:
-                self._wait_for_key_locked(result_key, tag)
-
+            deadline = _time.monotonic() + _COLLECTIVE_TIMEOUT_SECONDS
+            while True:
+                failure = self._values.get("spawn:abort") or self._values.get(abort_key)
+                if failure is not None:
+                    self._failure = str(failure)
+                    raise _TransportFailure(self._failure)
+                if result_key in self._values:
+                    break
+                remaining = deadline - _time.monotonic()
+                if remaining <= 0:
+                    self._values[abort_key] = f"timed out waiting for local collective {tag}"
+                    self._condition.notify_all()
+                    continue
+                self._condition.wait(timeout=min(remaining, 0.1))
             result = self._values[result_key]
-            self._leave_collective_locked(tag, [values_key, result_key, leave_key])
+            leaves = int(self._values.get(leave_key, 0)) + 1
+            self._values[leave_key] = leaves
+            if leaves == self.world_size:
+                for key in (entries_key, result_key, leave_key):
+                    self._values.pop(key, None)
             return result
-
-    def _broadcast_payload(self, tag, payload, src):
-        result_key = f"{tag}:result"
-        seen_key = f"{tag}:seen"
-        leave_key = f"{tag}:leave"
-
-        with self._condition:
-            seen = dict(self._values.get(seen_key, {}))
-            seen[self._rank] = True
-            self._values[seen_key] = seen
-            if self._rank == src:
-                self._values[result_key] = payload
-                self._condition.notify_all()
-            else:
-                self._wait_for_key_locked(result_key, tag)
-
-            result = self._values[result_key]
-            self._leave_collective_locked(tag, [seen_key, result_key, leave_key])
-            return result
-
-    def _barrier(self, tag):
-        count_key = f"{tag}:count"
-        done_key = f"{tag}:done"
-        leave_key = f"{tag}:leave"
-
-        with self._condition:
-            count = int(self._values.get(count_key, 0)) + 1
-            self._values[count_key] = count
-            if count == self._world_size:
-                self._values[done_key] = True
-                self._condition.notify_all()
-            else:
-                self._wait_for_key_locked(done_key, tag)
-            self._leave_collective_locked(tag, [count_key, done_key, leave_key])
-
-    def _wait_for_key_locked(self, key, tag):
-        deadline = _time.monotonic() + _COLLECTIVE_TIMEOUT_SECONDS
-        while key not in self._values:
-            remaining = deadline - _time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(
-                    "timed out waiting for local collective "
-                    f"{tag} on rank {self._rank}/{self._world_size}; missing key {key!r}"
-                )
-            self._condition.wait(timeout=remaining)
-
-    def _leave_collective_locked(self, tag, keys):
-        leave_key = f"{tag}:leave"
-        leave_count = int(self._values.get(leave_key, 0)) + 1
-        self._values[leave_key] = leave_count
-        if leave_count == self._world_size:
-            for key in keys:
-                self._values.pop(key, None)
-            self._condition.notify_all()
 
 
 def _tensor_to_payload(tensor):
@@ -181,7 +151,7 @@ def _copy_payload_into_tensor(payload, tensor):
 
     array = _np.ascontiguousarray(_payload_to_numpy(payload))
     source = _ortho.from_numpy(array)
-    # The staging copy has to land on the DESTINATION tensor's exact device:
+    # The staging copy has to land on the destination tensor's exact device:
     # _copy_flat_range_from requires src.device == dst.device, and a bare
     # "cuda" spec resolves to cuda:0, so a collective over tensors on cuda:1
     # would fail with "copy_flat_range: device mismatch".
@@ -201,78 +171,67 @@ def create_store(ctx=None):
     }
 
 
-def _spawn_worker_entry(rank, world_size, backend_name, store, fn, args, results, errors):
-    import orthon.distributed as _ddist
+def _abort_store(store, message):
+    with store["condition"]:
+        store["values"]["spawn:abort"] = message
+        store["condition"].notify_all()
 
+
+def _spawn_worker_entry(rank, world_size, backend_name, store, fn, args, results, errors):
+    import orthon.distributed as ddist
     try:
-        kwargs = {
-            "backend": backend_name,
-            "rank": rank,
-            "world_size": world_size,
-            "store": store,
-        }
+        kwargs = dict(backend=backend_name, rank=rank, world_size=world_size, store=store)
         if backend_name == "nccl":
             kwargs["device"] = rank
-        _ddist.init_process_group(**kwargs)
+        ddist.init_process_group(**kwargs)
         results[rank] = fn(rank, *args)
     except BaseException:
-        errors.put((rank, _traceback.format_exc()))
+        message = _traceback.format_exc()
+        errors[rank] = message
+        _abort_store(store, f"rank {rank} failed: {message}")
         raise
     finally:
-        _ddist.destroy_process_group()
+        ddist.destroy_process_group()
 
 
 def spawn(fn, args=(), nprocs=2, backend="local"):
-    """Run a function across local worker processes with DDP-lite initialized.
-
-    This helper uses the local multiprocessing backend for correctness testing
-    and small CPU demos. It is not an NCCL, multi-GPU, or production launcher.
-    """
+    """Run local workers with bounded failure supervision and shared abort."""
     if nprocs < 1:
         raise ValueError("nprocs must be >= 1")
     if _state.is_initialized():
         raise RuntimeError("cannot spawn while distributed is already initialized")
-
     ctx = _mp.get_context("spawn")
     manager, store = create_store(ctx)
-    results = manager.list([None] * nprocs)
-    errors = ctx.Queue()
     processes = []
     try:
+        results, errors = manager.list([None] * nprocs), manager.dict()
         for rank in range(nprocs):
-            process = ctx.Process(
-                target=_spawn_worker_entry,
-                args=(rank, nprocs, backend, store, fn, args, results, errors),
-            )
+            process = ctx.Process(target=_spawn_worker_entry,
+                                 args=(rank, nprocs, backend, store, fn, args, results, errors))
             process.start()
             processes.append(process)
-
-        for process in processes:
-            process.join()
-
-        failures = []
-        while not errors.empty():
-            failures.append(errors.get())
-        bad_exits = [
-            (rank, process.exitcode)
-            for rank, process in enumerate(processes)
-            if process.exitcode != 0
-        ]
+        while any(p.is_alive() for p in processes):
+            if errors or any(p.exitcode not in (None, 0) for p in processes):
+                break
+            for process in processes:
+                process.join(timeout=0.05)
+        failures = dict(errors)
+        bad_exits = [(r, p.exitcode) for r, p in enumerate(processes) if p.exitcode not in (None, 0)]
         if failures or bad_exits:
-            details = [f"rank {rank} failed:\n{tb}" for rank, tb in failures]
-            details.extend(f"rank {rank} exited with code {code}" for rank, code in bad_exits)
+            details = [f"rank {r} failed:\n{tb}" for r, tb in sorted(failures.items())]
+            details.extend(f"rank {r} exited with code {code}" for r, code in bad_exits)
             raise RuntimeError("local distributed spawn failed\n" + "\n".join(details))
         return list(results)
     finally:
         for process in processes:
             if process.is_alive():
                 process.terminate()
-                process.join()
+        for process in processes:
+            process.join(timeout=2)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=2)
         manager.shutdown()
 
 
-__all__ = [
-    "LocalBackend",
-    "create_store",
-    "spawn",
-]
+__all__ = ["LocalBackend", "create_store", "spawn"]

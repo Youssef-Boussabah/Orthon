@@ -1,3 +1,4 @@
+from tests.support.capabilities import orthon_cuda_available
 import orthon as ortho
 import pytest
 
@@ -60,17 +61,10 @@ def test_backward_no_requires_grad_raises():
         c.backward()
 
 
-# ---------------------------------------------------------------------------
-# Leaf gradient ownership
-#
-# AddNode hands the SAME gradient object to both of its inputs, because both
-# partial derivatives are the identity. The arithmetic is right, but .grad is
-# public mutable state - DDP rescales it after all-reduce, AMP unscales it, and
-# user code may too - so two distinct leaves must own two distinct buffers or
-# `a.grad *= k` silently edits b.grad.
-# ---------------------------------------------------------------------------
+# AddNode returns the same gradient to both inputs, but distinct leaves must
+# own distinct mutable buffers: rescaling a.grad must not alter b.grad.
 
-_CUDA = ortho.cuda_enabled()
+_CUDA = orthon_cuda_available()
 _DEVICES = ["cpu"] + (["cuda"] if _CUDA else [])
 requires_cuda = pytest.mark.skipif(not _CUDA, reason="CUDA not available")
 
@@ -144,7 +138,7 @@ def test_broadcast_add_backward_gradients_unchanged(device):
 
 @pytest.mark.parametrize("device", _DEVICES)
 def test_same_leaf_on_both_sides_still_accumulates(device):
-    # One leaf used twice is a different situation: there is only ONE leaf, so
+    # One leaf used twice is a different situation: there is only one leaf, so
     # its gradient must accumulate to 2 rather than be split into two owners.
     a = ortho.ones([2, 3])
     if device != "cpu":

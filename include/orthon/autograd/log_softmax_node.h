@@ -1,8 +1,8 @@
 #pragma once
 
 #include <orthon/autograd/node.h>
-#include <orthon/ops/cpu/shape_ops.h>
-#include <orthon/ops/cpu/softmax_ops.h>
+#include <orthon/ops/shape_ops.h>
+#include <orthon/ops/softmax_ops.h>
 #include <vector>
 #include <cstdint>
 

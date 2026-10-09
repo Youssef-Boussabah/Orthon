@@ -1,11 +1,12 @@
 """Tests for ortho.cast() and Tensor.cast()."""
+from tests.support.capabilities import orthon_cuda_available
 import math
 import pytest
 import numpy as np
 
 import orthon as ortho
 
-CUDA = ortho.cuda_enabled()
+CUDA = orthon_cuda_available()
 
 # Helpers.
 

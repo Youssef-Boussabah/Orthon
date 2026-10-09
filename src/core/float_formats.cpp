@@ -12,7 +12,7 @@ uint16_t f32_to_f16_bits(float value) {
     const uint32_t sign = (x >> 16) & 0x8000u;   // already in half position
     const uint32_t mag  = x & 0x7FFFFFFFu;       // magnitude, sign stripped
 
-    // ---- Inf / NaN -------------------------------------------------------
+    // Inf / NaN
     if (mag >= 0x7F800000u) {
         if (mag > 0x7F800000u) {
             // NaN. Keep the top payload bits so a NaN stays distinguishable,
@@ -25,18 +25,18 @@ uint16_t f32_to_f16_bits(float value) {
         return static_cast<uint16_t>(sign | 0x7C00u);
     }
 
-    // ---- Magnitudes at or above 2^16 always overflow ----------------------
+    // Magnitudes at or above 2^16 always overflow
     //
     // Not merely an optimisation: the normal path below subtracts a bias and
     // shifts, and for a float32 this large the result would run past bit 15
-    // and corrupt the sign. Values just under 2^16 are NOT short-circuited
+    // and corrupt the sign. Values just under 2^16 are not short-circuited
     // here - 65504 must stay finite, and 65520 must round up to infinity -
     // so that boundary is left to the rounding step, which handles it by
     // carrying the mantissa into the exponent.
     if (mag >= 0x47800000u)
         return static_cast<uint16_t>(sign | 0x7C00u);
 
-    // ---- Normal half range: |x| >= 2^-14 ---------------------------------
+    // Normal half range: |x| >= 2^-14
     if (mag >= 0x38800000u) {
         // Re-bias 127 -> 15 and drop 13 mantissa bits in one step. The
         // addition wraps modulo 2^32, which is exactly mag - (112 << 23);
@@ -50,7 +50,7 @@ uint16_t f32_to_f16_bits(float value) {
         return static_cast<uint16_t>(sign | bits);
     }
 
-    // ---- Below the smallest representable magnitude ----------------------
+    // Below the smallest representable magnitude
     // The smallest half subnormal is 2^-24; anything under 2^-25 rounds to
     // zero, and exactly 2^-25 is a tie that ties-to-even also sends to zero
     // (handled by the subnormal path below, which is why the cutoff is
@@ -58,7 +58,7 @@ uint16_t f32_to_f16_bits(float value) {
     if (mag < 0x33000000u)
         return static_cast<uint16_t>(sign);
 
-    // ---- Subnormal half --------------------------------------------------
+    // Subnormal half
     // A half subnormal is k * 2^-24 for integer k in [0, 1023]. With the
     // implicit leading 1 restored, k = mant24 >> (126 - biased_exp32).
     const uint32_t exp   = mag >> 23;                       // 102..112

@@ -6,21 +6,21 @@
 #include <orthon/core/tensor_impl.h>
 #include <orthon/core/dtype.h>
 #include <orthon/core/float_formats.h>
-#include <orthon/ops/cpu/fill_ops.h>
-#include <orthon/ops/cpu/binary_ops.h>
-#include <orthon/ops/cpu/scalar_ops.h>
-#include <orthon/ops/cpu/shape_ops.h>
-#include <orthon/ops/cpu/reduce_ops.h>
-#include <orthon/ops/cpu/unary_ops.h>
-#include <orthon/ops/cpu/matmul_ops.h>
-#include <orthon/ops/cpu/softmax_ops.h>
-#include <orthon/ops/cpu/cross_entropy_ops.h>
-#include <orthon/ops/cpu/nll_loss_ops.h>
-#include <orthon/ops/cpu/conv2d_ops.h>
-#include <orthon/ops/cpu/maxpool2d_ops.h>
-#include <orthon/ops/cpu/fusion_ops.h>
-#include <orthon/ops/cpu/embedding_ops.h>
-#include <orthon/ops/cpu/cast_ops.h>
+#include <orthon/ops/fill_ops.h>
+#include <orthon/ops/binary_ops.h>
+#include <orthon/ops/scalar_ops.h>
+#include <orthon/ops/shape_ops.h>
+#include <orthon/ops/reduce_ops.h>
+#include <orthon/ops/unary_ops.h>
+#include <orthon/ops/matmul_ops.h>
+#include <orthon/ops/softmax_ops.h>
+#include <orthon/ops/cross_entropy_ops.h>
+#include <orthon/ops/nll_loss_ops.h>
+#include <orthon/ops/conv2d_ops.h>
+#include <orthon/ops/maxpool2d_ops.h>
+#include <orthon/ops/fusion_ops.h>
+#include <orthon/ops/embedding_ops.h>
+#include <orthon/ops/cast_ops.h>
 
 #include <cstring>
 #include <optional>
@@ -28,8 +28,8 @@
 #include <vector>
 
 #ifdef WITH_CUDA
-#include <orthon/ops/cuda/matmul_kernels.h>
-#include <orthon/ops/cuda/conv2d_kernels.h>
+#include <orthon/backends/cuda/matmul_kernels.h>
+#include <orthon/backends/cuda/conv2d_kernels.h>
 #endif
 
 namespace py = pybind11;
@@ -48,6 +48,15 @@ static DType dtype_from_string(const std::string& s) {
     if (s == "int8")     return DType::Int8;
     if (s == "bool")     return DType::Bool;
     throw std::invalid_argument("unknown dtype string: " + s);
+}
+
+static py::array native_numpy_array(py::array array) {
+    if (array.dtype().attr("isnative").cast<bool>())
+        return array;
+    return py::module_::import("numpy").attr("array")(
+        array, py::arg("dtype") = array.dtype().attr("newbyteorder")("="),
+        py::arg("order") = "C", py::arg("copy") = true,
+        py::arg("subok") = false).cast<py::array>();
 }
 
 void bind_ops(py::module_& m) {
@@ -89,6 +98,7 @@ void bind_ops(py::module_& m) {
                         "from_numpy: dtype='bfloat16' requires a float32 input array");
                 if ((array.flags() & py::array::c_style) != py::array::c_style)
                     throw py::value_error("from_numpy: expected a C-contiguous array");
+                array = native_numpy_array(array);
                 py::buffer_info info = array.request();
                 std::vector<int64_t> shape;
                 shape.reserve(static_cast<size_t>(info.ndim));
@@ -96,15 +106,18 @@ void bind_ops(py::module_& m) {
                     shape.push_back(static_cast<int64_t>(dim));
                 const int64_t n = static_cast<int64_t>(info.size);
                 Tensor out(std::make_shared<TensorImpl>(shape, DType::BFloat16, Device{}));
-                const float*    src = static_cast<const float*>(info.ptr);
+                const char*     src = static_cast<const char*>(info.ptr);
                 uint16_t*       dst = static_cast<uint16_t*>(out.data());
                 // The canonical ties-to-even helper, not an inline
                 // `(bits + 0x8000u) >> 16` (round-half-UP). Ad-hoc rounding
                 // at each call site is what would let the same float32 value
                 // reach bfloat16 storage as a different bit pattern depending
                 // on which entry point built it.
-                for (int64_t i = 0; i < n; ++i)
-                    dst[i] = f32_to_bf16_bits(src[i]);
+                for (int64_t i = 0; i < n; ++i) {
+                    float value;
+                    std::memcpy(&value, src + i * sizeof(float), sizeof(float));
+                    dst[i] = f32_to_bf16_bits(value);
+                }
                 return out;
             }
             throw py::type_error(
@@ -128,6 +141,7 @@ void bind_ops(py::module_& m) {
         if ((array.flags() & py::array::c_style) != py::array::c_style)
             throw py::value_error("from_numpy: expected a C-contiguous array");
 
+        array = native_numpy_array(array);
         py::buffer_info info = array.request();
         std::vector<int64_t> shape;
         shape.reserve(static_cast<size_t>(info.ndim));
@@ -154,11 +168,6 @@ void bind_ops(py::module_& m) {
           py::arg("a"), py::arg("b"));
     m.def("div", [](const Tensor& a, const Tensor& b) { return div(a, b); },
           py::arg("a"), py::arg("b"));
-
-    // Underscore-private diagnostic. Not public API: it exists so
-    // the scalar representation contract - rank 0, tensor dtype, exact Device,
-    // untracked - can be pinned by a test instead of inferred from behaviour.
-    m.def("_scalar_like", &scalar_like, py::arg("reference"), py::arg("value"));
 
     m.def("fill_", [](Tensor& t, float value) -> Tensor& {
         fill_(t, value);
@@ -293,7 +302,6 @@ void bind_ops(py::module_& m) {
     // Underscore-private like the other matmul diagnostics; both validate
     // rank/device/dtype/contiguity before launching. A is (M,K), B is (K,N).
     m.def("_matmul_naive", &cuda_matmul_naive, py::arg("a"), py::arg("b"));
-    m.def("_matmul_tiled", &cuda_matmul_tiled, py::arg("a"), py::arg("b"));
     m.def("_matmul_tiled_custom", &cuda_matmul_tiled_custom,
           py::arg("a"), py::arg("b"));
     m.def("_matmul_tiled_cublas", &cuda_matmul_tiled_cublas,
@@ -302,16 +310,10 @@ void bind_ops(py::module_& m) {
           py::arg("a"), py::arg("b"));
     m.def("_matmul_batched_tiled_cublas", &cuda_batched_matmul_tiled_cublas,
           py::arg("a"), py::arg("b"));
-    m.def("_matmul_uses_cublas", &cuda_matmul_uses_cublas,
-          py::arg("a"), py::arg("b"));
     m.def("_matmul_dispatch_path", &cuda_matmul_dispatch_path,
           py::arg("a"), py::arg("b"));
     m.def("_matmul_cublas_guard_report", &cuda_matmul_cublas_guard_report,
           py::arg("a"), py::arg("b"));
-    m.def("_matmul_cublas_elapsed_ms", &cuda_matmul_cublas_elapsed_ms,
-          py::arg("a"), py::arg("b"), py::arg("reps") = 100);
-    m.def("_matmul_cublas_profile_report", &cuda_matmul_cublas_profile_report,
-          py::arg("a"), py::arg("b"), py::arg("reps") = 100);
     m.def("_conv2d_cuda_naive", &cuda_conv2d_forward_naive,
           py::arg("input"), py::arg("weight"), py::arg("bias"),
           py::arg("stride_h") = (int64_t)1, py::arg("stride_w") = (int64_t)1,
@@ -358,7 +360,5 @@ void bind_ops(py::module_& m) {
           py::arg("bias"), py::arg("grad_output"));
     m.def("_conv2d_cuda_backward_bias_optimized", &cuda_conv2d_backward_bias_optimized,
           py::arg("bias"), py::arg("grad_output"));
-    m.def("_conv2d_cuda_profile_reset", &cuda_conv2d_profile_reset);
-    m.def("_conv2d_cuda_profile_summary", &cuda_conv2d_profile_summary);
 #endif
 }

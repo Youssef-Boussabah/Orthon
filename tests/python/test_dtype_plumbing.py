@@ -4,17 +4,12 @@ Covers creation, from_numpy, tolist/item, CPU/CUDA round-trips, and
 non-contiguous contiguous() copies for all newly-supported dtypes.
 No arithmetic ops are tested here.
 """
+from tests.support.capabilities import orthon_cuda_available as _cuda_available
 import pytest
 import numpy as np
 import orthon as ortho
 
 
-def _cuda_available():
-    try:
-        ortho.zeros([1]).to("cuda")
-        return True
-    except RuntimeError:
-        return False
 
 
 cuda_available = _cuda_available()
@@ -72,6 +67,116 @@ def test_from_numpy_bool():
 def test_from_numpy_unsupported_raises():
     with pytest.raises((TypeError, Exception)):
         ortho.from_numpy(np.array([1+2j], dtype=np.complex64))
+
+
+@pytest.mark.parametrize("dtype", ["float16", "float32", "float64", "int32", "int64"])
+@pytest.mark.parametrize("order", ["=", "<", ">"])
+def test_r3_numpy_byte_order_preserves_values_bits_and_input(dtype, order):
+    if dtype.startswith("float"):
+        native = np.array([1.5, -2.25, 0., -0., np.inf, -np.inf, np.nan, .125], dtype=dtype)
+    else:
+        bounds = np.iinfo(dtype)
+        native = np.array([bounds.min, -257, -1, 0, 1, 257, bounds.max], dtype=dtype)
+    source = native.astype(native.dtype.newbyteorder(order))
+    original = source.tobytes()
+    result = ortho.from_numpy(source)
+    assert result.dtype == dtype and result.shape == source.shape
+    assert ortho._tensor_to_bytes(result) == native.tobytes()
+    assert source.tobytes() == original and source.dtype.byteorder == native.dtype.newbyteorder(order).byteorder
+    np.testing.assert_equal(result.tolist(), native.tolist())
+    source.fill(0)
+    assert ortho._tensor_to_bytes(result) == native.tobytes()
+
+
+@pytest.mark.parametrize("dtype,values", [
+    ("int8", [-128, -1, 0, 127]), ("uint8", [0, 1, 127, 255]),
+    ("bool", [True, False, True, False]),
+])
+def test_r3_numpy_byte_order_independent_types(dtype, values):
+    source = np.array(values, dtype=dtype)
+    assert source.dtype.byteorder == "|"
+    result = ortho.from_numpy(source)
+    assert result.dtype == dtype and result.tolist() == values
+    assert ortho._tensor_to_bytes(result) == source.tobytes()
+
+
+@pytest.mark.parametrize("layout", ["scalar", "empty", "matrix", "offset"])
+def test_r3_foreign_numpy_layout_and_lifetime(layout):
+    native = np.arange(12, dtype=np.float32).reshape(3, 4)
+    if layout == "scalar":
+        native = np.array(-0., dtype=np.float32)
+    elif layout == "empty":
+        native = native[:0]
+    elif layout == "offset":
+        native = native[1:]
+    foreign = np.dtype("f4").newbyteorder("S")
+    # Build the offset after conversion so the supplied foreign array is a view.
+    source = (np.arange(12, dtype=np.float32).astype(foreign).reshape(3, 4)[1:]
+              if layout == "offset" else native.astype(foreign))
+    assert source.flags.c_contiguous
+    result = ortho.from_numpy(source)
+    assert result.shape == native.shape
+    assert ortho._tensor_to_bytes(result) == native.tobytes()
+    del source
+    assert ortho._tensor_to_bytes(result) == native.tobytes()
+
+
+@pytest.mark.parametrize("order", ["=", "<", ">"])
+def test_r3_bfloat16_endian_rounding_and_nonfinite_bits(order):
+    words = np.array([0x3f808000, 0x3f818000, 0xbf808000, 0xbf818000,
+                      0, 0x80000000, 0x7f800000, 0xff800000, 0x7fc12345], dtype=np.uint32)
+    native = words.view(np.float32)
+    source = native.astype(native.dtype.newbyteorder(order))
+    original = source.tobytes()
+    result = ortho.from_numpy(source, dtype="bfloat16")
+    expected = np.array([0x3f80, 0x3f82, 0xbf80, 0xbf82, 0, 0x8000,
+                         0x7f80, 0xff80, 0x7fc1], dtype=np.uint16).tobytes()
+    assert ortho._tensor_to_bytes(result) == expected
+    assert ortho._tensor_to_bytes(ortho.from_numpy(native, dtype="bfloat16")) == expected
+    assert source.tobytes() == original
+
+
+@pytest.mark.parametrize("foreign", [False, True])
+def test_r3_bfloat16_legal_unaligned_contiguous_input(foreign):
+    dtype = np.dtype("f4").newbyteorder("S" if foreign else "=")
+    backing = bytearray(13)
+    source = np.ndarray((3,), dtype=dtype, buffer=backing, offset=1)
+    source[:] = [1., -2., .5]
+    assert source.flags.c_contiguous and not source.flags.aligned
+    original = bytes(backing)
+    assert ortho.from_numpy(source, dtype="bfloat16").tolist() == [1., -2., .5]
+    assert bytes(backing) == original
+
+
+@pytest.mark.parametrize("override", [None, "bfloat16"])
+def test_r3_foreign_numpy_preserves_layout_rejection(override):
+    source = np.arange(12, dtype=np.float32).astype(np.dtype("f4").newbyteorder("S")).reshape(3, 4).T
+    with pytest.raises(ValueError, match="from_numpy: expected a C-contiguous array"):
+        ortho.from_numpy(source, dtype=override)
+
+
+@pytest.mark.parametrize("dtype", ["complex64", "object", "uint32"])
+def test_r3_numpy_unsupported_dtype_stays_rejected(dtype):
+    with pytest.raises(TypeError, match="from_numpy: unsupported array dtype"):
+        ortho.from_numpy(np.array([1], dtype=dtype))
+
+
+def test_r3_numpy_override_does_not_add_implicit_casts():
+    with pytest.raises(TypeError, match="explicit dtype= override only supports"):
+        ortho.from_numpy(np.array([1.], dtype=np.float64), dtype="float32")
+    with pytest.raises(TypeError, match="requires a float32 input array"):
+        ortho.from_numpy(np.array([1.], dtype=np.float64), dtype="bfloat16")
+    with pytest.raises(TypeError, match="unsupported array dtype"):
+        ortho.from_numpy(np.zeros(1, dtype=[("value", ">f4")]))
+
+
+@requires_cuda
+def test_r3_normalized_numpy_values_survive_cuda_transfer():
+    native = np.array([[1.5, -2.25], [-0., .125]], dtype=np.float32)
+    source = native.astype(native.dtype.newbyteorder("S"))
+    result = ortho.from_numpy(source).to("cuda")
+    assert result.dtype == "float32"
+    assert ortho._tensor_to_bytes(result.to("cpu")) == native.tobytes()
 
 
 # fill ops with dtype keyword.

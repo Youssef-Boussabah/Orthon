@@ -1,44 +1,8 @@
-"""CPU/CUDA runtime consistency.
+"""CPU/CUDA logical-order parity, exact-device placement and mutation selectivity.
 
-The device an operation runs on must not change what it means. Four classes of
-divergence are pinned here, each of which is silent rather than loud when it
-goes wrong:
-
-1. VIEWS. CPU walks arbitrary strides for ``add``/``mul``, every public unary,
-   ``dropout``, real dtype ``cast``, ``fused_linear_relu`` and ``embedding``,
-   so CUDA must consume the logically equivalent views. A raw CUDA kernel that
-   receives a strided pointer and indexes storage LINEARLY returns storage-order
-   values with no error at all, and can read past the end of a view's storage.
-
-2. ``cast(x, x.dtype)`` means one thing on both devices: ``contiguous(x)``.
-   Falling into cuda_cast's memcpy branch on CUDA instead returns a fresh
-   DETACHED copy, so an operation that converts nothing behaves differently
-   per device.
-
-3. Python runtime helpers move tensors with a Device OBJECT, never the STRING
-   ``"cuda"`` - the Device parser resolves that to cuda:0, so a module or
-   collective living on cuda:1 would build its helper tensors on the wrong GPU.
-
-4. ``set_item``, the full-index ``__setitem__`` and ``get_item`` route through
-   the CUDA runtime. Dereferencing ``t.data()`` from host C++ on a CUDA tensor
-   is device memory, and terminates the process with an access violation
-   (0xC0000005).
-
-The load-bearing design decision is that CUDA kernels stay contiguous-only.
-Nothing here teaches a kernel about strides; the public op materialises only
-its KERNEL OPERAND, under an explicit NoGradGuard, and attaches the public
-autograd Node to the ORIGINAL user tensor. That is what keeps the public graph
-shape, the saved-version watches and view backward routing pinned to what the
-caller passed - and what would break, invisibly, if a future change saved the
-temporary instead. The tests in TestMutationSelectivity exist specifically to
-catch that mistake.
-
-HONESTY NOTE: this machine has one GPU. Every genuinely multi-device assertion
-skips explicitly rather than pretending to run; on a single GPU the exact-device
-assertions read ``device('cuda:0')`` (not merely ``is_cuda``), which is a
-regression tripwire, and the load-bearing evidence is the source-level audit at
-the bottom of this file.
-"""
+CUDA execution operands are contiguous temporaries; public Nodes retain the
+original Tensor and its view/version semantics. Host access uses runtime transfers."""
+from tests.support.capabilities import orthon_cuda_available
 import os
 import re
 
@@ -48,7 +12,7 @@ import pytest
 import orthon as ortho
 import orthon.nn as nn
 
-CUDA = ortho.cuda_enabled()
+CUDA = orthon_cuda_available()
 DEVICES = ["cpu"] + (["cuda"] if CUDA else [])
 requires_cuda = pytest.mark.skipif(not CUDA, reason="CUDA not available")
 
@@ -85,6 +49,7 @@ def _flat(t):
 
 
 def _read(rel):
+    rel = rel.replace("src/ops/cuda/", "src/backends/cuda/").replace("src/ops/cpu/", "src/ops/")
     with open(os.path.join(REPO, rel), encoding="utf-8") as fh:
         return fh.read()
 
@@ -100,14 +65,11 @@ def _strip_py_comments_and_docstrings(src):
     return re.sub(r"#[^\n]*", "", src)
 
 
-# ---------------------------------------------------------------------------
 # CUDA binary ops accept logical views
-# ---------------------------------------------------------------------------
-
 class TestBinaryViews:
     """Every view/operand combination, checked against the CPU result.
 
-    Each case is run on BOTH devices from the same source values, so the
+    Each case is run on both devices from the same source values, so the
     assertion is CPU/CUDA agreement on logical values, not just "CUDA does
     not raise". Without operand normalisation every CUDA case here raises
     "cuda_add/cuda_mul: input 'a' is not contiguous".
@@ -182,7 +144,7 @@ class TestBinaryViews:
     @requires_cuda
     @pytest.mark.parametrize("op", ["add_", "mul_"])
     def test_inplace_still_requires_a_contiguous_destination(self, op):
-        """Deliberately NOT loosened: see the note above mul_ in binary_ops.cpp.
+        """Deliberately not loosened: see the note above mul_ in binary_ops.cpp.
 
         An out-of-place op may materialise its operands because they are only
         read. An in-place op writes to its destination; materialising that
@@ -200,10 +162,7 @@ class TestBinaryViews:
         assert _flat(base) == list(BASE.reshape(-1))
 
 
-# ---------------------------------------------------------------------------
 # CUDA unary ops accept logical views
-# ---------------------------------------------------------------------------
-
 UNARY = {
     "neg":        lambda t: ortho.neg(t),
     "relu":       lambda t: ortho.relu(t),
@@ -295,10 +254,7 @@ class TestUnaryViews:
             assert grads["cuda"] == pytest.approx(grads["cpu"], rel=1e-4, abs=1e-5)
 
 
-# ---------------------------------------------------------------------------
 # dropout on a CUDA view
-# ---------------------------------------------------------------------------
-
 class TestDropoutViews:
     @requires_cuda
     def test_dropout_accepts_a_cuda_view_with_no_kernel_change(self):
@@ -340,10 +296,7 @@ class TestDropoutViews:
         assert base.grad.device == base.device
 
 
-# ---------------------------------------------------------------------------
 # cast on views, and the unified same-dtype contract
-# ---------------------------------------------------------------------------
-
 CUDA_CAST_PAIRS = [("float32", "float16"), ("float32", "bfloat16"),
                    ("float16", "float32"), ("bfloat16", "float32")]
 
@@ -458,18 +411,15 @@ class TestSameDtypeCastContract:
         assert [p._impl_id for p in model.parameters()] == before
 
 
-# ---------------------------------------------------------------------------
 # exact CUDA device propagation
-# ---------------------------------------------------------------------------
-
 @requires_cuda
 class TestExactDevicePropagationSingleGpu:
-    """Single-GPU assertions read the EXACT device, not merely is_cuda().
+    """Single-GPU assertions read the exact device, not merely is_cuda().
 
     With one GPU these cannot distinguish a correct fix from a lucky cuda:0
     default, so they are regression tripwires for multi-GPU CI; the >=2 GPU
     class below is the real test and the source audit at the bottom is the
-    load-bearing single-GPU evidence.
+    exact-device source invariant.
     """
 
     def _dev(self):
@@ -485,9 +435,9 @@ class TestExactDevicePropagationSingleGpu:
         these call sites.
         """
         x = _t(BASE, "cuda")
-        s = ortho._scalar_like(x, 0.5)
+        s = x + 0.5
         assert str(s.device) == "device('cuda:0')"
-        assert tuple(s.shape) == ()
+        assert tuple(s.shape) == tuple(x.shape)
         assert str((x * 0.5).device) == "device('cuda:0')"
         assert str((0.5 - x).device) == "device('cuda:0')"
         assert str((x / 2.0).device) == "device('cuda:0')"
@@ -530,7 +480,7 @@ class TestExactDevicePropagationSingleGpu:
 
 @requires_2_gpus
 class TestExactDevicePropagationMultiGpu:
-    """The real exact-device tests. They SKIP on this one-GPU machine."""
+    """Exact-device propagation requires at least two CUDA devices."""
 
     # No helper-constant test here any more: it imported private helpers
     # (functional.math._scalar, nn.layernorm._constant_like_shape) that were
@@ -569,10 +519,7 @@ class TestExactDevicePropagationMultiGpu:
         assert _flat(dst) == [1.0, 2.0, 3.0]
 
 
-# ---------------------------------------------------------------------------
 # CUDA scalar mutation safety and version accounting
-# ---------------------------------------------------------------------------
-
 class TestScalarMutation:
     """The CUDA cases here fail as process kills, not exceptions, when they
     go wrong: 0xC0000005 for set_item, the full-index __setitem__ and
@@ -686,10 +633,7 @@ class TestPartialSetItem:
         assert t._storage_version == 1
 
 
-# ---------------------------------------------------------------------------
 # Versioning watches the ORIGINAL operand, not the materialised temporary
-# ---------------------------------------------------------------------------
-
 class TestMutationSelectivity:
     """The subtle mistake internal materialisation invites.
 
@@ -769,10 +713,7 @@ class TestMutationSelectivity:
             loss.backward()
 
 
-# ---------------------------------------------------------------------------
 # public autograd graph shape survives internal normalisation
-# ---------------------------------------------------------------------------
-
 class TestPublicAutogradRegression:
     @pytest.mark.parametrize("device", DEVICES)
     def test_transpose_then_tanh_reaches_the_base(self, device):
@@ -828,10 +769,7 @@ class TestPublicAutogradRegression:
             assert not t._has_grad_fn
 
 
-# ---------------------------------------------------------------------------
 # fused_linear_relu view parity
-# ---------------------------------------------------------------------------
-
 class TestFusedLinearReluViews:
     @requires_cuda
     def test_strided_x_matches_cpu(self):
@@ -874,10 +812,7 @@ class TestFusedLinearReluViews:
                 assert got == pytest.approx(want, abs=1e-5)
 
 
-# ---------------------------------------------------------------------------
 # Embedding: contiguity precondition is now device-symmetric
-# ---------------------------------------------------------------------------
-
 class TestEmbeddingContiguity:
     """The precondition is stated once, for both devices. Enforcing it only
     on CPU lets CUDA accept strided indices and read them in storage order,
@@ -912,14 +847,11 @@ class TestEmbeddingContiguity:
                                                      10.0, 20.0, 1.0, 2.0]
 
 
-# ---------------------------------------------------------------------------
 # cross-GPU Tensor::to
-# ---------------------------------------------------------------------------
-
 @requires_2_gpus
 class TestCrossGpuTransfer:
-    """These SKIP on this one-GPU machine. The mechanism change is asserted at
-    source level in TestSourceAudit instead."""
+    """Cross-device transfers require at least two CUDA devices.
+    TestSourceAudit also checks device selection independently of hardware."""
 
     def test_cuda0_to_cuda1_preserves_values_and_device(self):
         x = _t(BASE, "cuda:0")
@@ -952,18 +884,17 @@ class TestCrossGpuTransfer:
         assert _flat(y) == list(BASE.T.reshape(-1))
 
 
-# ---------------------------------------------------------------------------
-# Source-level audit (the load-bearing single-GPU evidence)
-# ---------------------------------------------------------------------------
-
+# Exact-device source boundaries
 class TestSourceAudit:
     def test_kernel_operand_is_the_single_normalisation_helper(self):
         body = _strip_c_comments(_read("src/ops/cpu/shape_ops.cpp"))
         impl = body[body.index("Tensor kernel_operand(const Tensor& t)"):]
         impl = impl[:impl.index("Tensor transpose(")]
-        assert "if (t.is_contiguous()) return t;" in impl
-        assert "NoGradGuard guard;" in impl
-        assert "return t.to(t.device());" in impl
+        assert "return execution_operand(t);" in impl
+        execution = _strip_c_comments(_read("src/core/execution_copy.cpp"))
+        assert "if (t.is_contiguous()) return t;" in execution
+        assert "resolve<TransferKernel>" in execution
+        assert "set_grad_fn" not in execution
         # It must not attach a public node.
         assert "ContiguousNode" not in impl
         assert "set_grad_fn" not in impl
@@ -977,17 +908,20 @@ class TestSourceAudit:
     def test_binary_cuda_sites_normalise_operands_but_save_originals(
             self, rel, call, node_args):
         body = _strip_c_comments(_read(rel))
-        assert call in body
+        # Supply the semantic broadcast shape to the validated CUDA
+        # execution overload.
+        adapter = _strip_c_comments(_read("src/backends/cuda/adapters.cpp"))
+        assert call[:-1].replace("kernel_operand(", "execution_operand(") + ", shape)" in adapter
         assert node_args in body
 
     @pytest.mark.parametrize("fn", ["cuda_neg", "cuda_relu", "cuda_sigmoid",
                                     "cuda_tanh", "cuda_leaky_relu", "cuda_gelu",
                                     "cuda_exp", "cuda_sqrt", "cuda_reciprocal"])
     def test_every_cuda_unary_forward_normalises_its_operand(self, fn):
-        body = _strip_c_comments(_read("src/ops/cpu/unary_ops.cpp"))
+        body = _strip_c_comments(_read("src/backends/cuda/adapters.cpp"))
         for m in re.finditer(r"(?<!\w)" + re.escape(fn) + r"\s*\(", body):
             tail = body[m.end():m.end() + 60]
-            assert tail.startswith("kernel_operand("), (
+            assert tail.startswith("execution_operand("), (
                 "%s is called without kernel_operand: ...%s" % (fn, tail[:40]))
 
     @pytest.mark.parametrize("fn", ["cuda_sigmoid_backward", "cuda_tanh_backward",
@@ -995,14 +929,14 @@ class TestSourceAudit:
                                     "cuda_exp_backward", "cuda_sqrt_backward",
                                     "cuda_reciprocal_backward"])
     def test_every_cuda_unary_backward_normalises_its_saved_input(self, fn):
-        body = _strip_c_comments(_read("src/ops/cpu/unary_ops.cpp"))
+        body = _strip_c_comments(_read("src/backends/cuda/adapters.cpp"))
         for m in re.finditer(r"(?<!\w)" + re.escape(fn) + r"\s*\(", body):
             tail = body[m.end():m.end() + 60]
-            assert tail.startswith("kernel_operand("), fn
+            assert tail.startswith("execution_operand("), fn
 
     def test_no_cuda_forward_wrapper_still_rejects_a_view(self):
         """The "CUDA path requires a contiguous tensor" guards are gone."""
-        body = _strip_c_comments(_read("src/ops/cpu/unary_ops.cpp"))
+        body = _strip_c_comments(_read("src/backends/cuda/adapters.cpp"))
         assert "CUDA path requires a contiguous tensor" not in body
 
     def test_cuda_kernels_were_not_taught_about_strides(self):
@@ -1023,7 +957,7 @@ class TestSourceAudit:
         body = _strip_c_comments(_read("src/ops/cpu/cast_ops.cpp"))
         fn = body[body.index("Tensor cast(const Tensor& src, DType dst_dtype)"):]
         same = fn.index("if (src.dtype() == dst_dtype)")
-        dispatch = fn.index("src.device().is_cuda()")
+        dispatch = fn.index("resolve<CastKernel>")
         assert same < dispatch, "same-dtype must short-circuit before dispatch"
         assert "return contiguous(src);" in fn[same:dispatch]
         # ...and the old CPU-only qualifier is gone.
@@ -1031,12 +965,12 @@ class TestSourceAudit:
 
     def test_cast_normalises_the_cuda_kernel_operand(self):
         body = _strip_c_comments(_read("src/ops/cpu/cast_ops.cpp"))
-        assert "cuda_cast(kernel_operand(src), dst_dtype)" in body
+        assert "cuda_cast(execution_operand(src), dst_dtype)" in _strip_c_comments(_read("src/backends/cuda/adapters.cpp"))
 
     def test_fused_linear_relu_normalises_all_three_cuda_operands(self):
         body = _strip_c_comments(_read("src/ops/cpu/fusion_ops.cpp"))
-        assert ("cuda_fused_linear_relu(\n            kernel_operand(x), "
-                "kernel_operand(weight), kernel_operand(bias))") in body
+        assert ("cuda_fused_linear_relu(\n            execution_operand(x), "
+                "execution_operand(weight), execution_operand(bias))") in _strip_c_comments(_read("src/backends/cuda/adapters.cpp"))
         assert "attach_fused_linear_relu_grad_fn(out, x, weight, bias)" in body
 
     def test_scalar_accessors_never_dereference_device_memory_on_the_host(self):
@@ -1049,20 +983,19 @@ class TestSourceAudit:
             impl = body[body.index("static " + ("void " if helper.startswith("write")
                                                 else "float ") + helper):]
             impl = impl[:impl.index("\n}\n")]
-            assert "t.device().is_cuda()" in impl
+            assert "orthon::scalar_" in impl
             assert "multi_index_offset(t, indices)" in impl
-        cuda_helper = body[body.index("static void cuda_copy_scalar_float32"):]
-        cuda_helper = cuda_helper[:cuda_helper.index("\n}\n")]
+        cuda_helper = _strip_c_comments(_read("src/backends/cuda/adapters.cpp"))
         assert "DeviceGuard guard(t.device())" in cuda_helper
-        assert "cudaMemcpyHostToDevice" in cuda_helper
-        assert "cudaMemcpyDeviceToHost" in cuda_helper
+        assert "context->copy_h2d_snapshot" in cuda_helper
+        assert "context->copy_d2h_blocking" in cuda_helper
 
     def test_scalar_write_bumps_once_after_the_copy(self):
         body = _strip_c_comments(_read("bindings/tensor_bindings.cpp"))
         impl = body[body.index("static void write_scalar_float32"):]
         impl = impl[:impl.index("\n}\n")]
         assert impl.count("bump_version()") == 1
-        assert impl.index("bump_version()") > impl.index("cuda_copy_scalar_float32")
+        assert impl.index("bump_version()") > impl.index("orthon::scalar_write_value")
 
     def test_partial_setitem_rejects_cuda_before_reaching_fill(self):
         body = _strip_c_comments(_read("bindings/tensor_bindings.cpp"))
@@ -1076,16 +1009,19 @@ class TestSourceAudit:
         assert reject < navigate < fill
 
     def test_cross_gpu_transfer_uses_an_explicit_peer_copy(self):
-        body = _strip_c_comments(_read("src/core/tensor.cpp"))
-        to_body = body[body.index("static Tensor to_physical"):]
-        to_body = to_body[:to_body.index("Tensor Tensor::to(Device target)")]
-        assert "cudaMemcpyPeer(" in to_body
+        body = _strip_c_comments(_read("src/backends/cuda/adapters.cpp"))
+        to_body = body[body.index("Tensor cuda_to_cuda"):]
+        to_body = to_body[:to_body.index("Tensor cuda_add_adapter")]
+        assert "context->peer_copy_blocking(" in to_body
         assert "cudaMemcpyDeviceToDevice" not in to_body
-        peer = to_body[to_body.index("cudaMemcpyPeer("):]
+        peer = to_body[to_body.index("context->peer_copy_blocking("):]
         peer = peer[:peer.index(";")]
         # Both ordinals named explicitly, source and destination not swapped.
-        assert "out.data(), target.index" in peer
-        assert "src_c.data(), src_c.device().index" in peer
+        assert "out.data(), *default_runtime().cuda(src_c.device().index)" in peer
+        assert "src_c.data(), nbytes" in peer
+        runtime = _strip_c_comments(_read("src/runtime/cuda_context.cpp"))
+        assert "cudaMemcpyPeerAsync(dst, device_.index, src, source.device().index" in runtime
+        assert "source.synchronize_compute()" in runtime
         # No permanent peer-access enabling was introduced as a side effect.
         assert "cudaDeviceEnablePeerAccess" not in body
 
@@ -1107,16 +1043,8 @@ class TestSourceAudit:
         assert ".to(" in impl
 
     def test_scalar_constant_helpers_were_removed_not_merely_fixed(self):
-        """The constant-placing helpers do not exist at all.
-
-        functional/math.py:_scalar, nn/layernorm.py:_constant_like_shape,
-        nn/batchnorm.py:_constant_like and the two _negate helpers each existed
-        to build a small constant tensor and hand-place it on the caller's
-        exact device - the exact spot where a bare "cuda" string resolves to
-        cuda:0. Scalar arithmetic carries dtype and exact Device by contract,
-        so the failure mode is unreachable at those call sites rather than
-        merely corrected in each helper.
-        """
+        """Scalar arithmetic owns dtype and exact-device placement; hand-placed constant
+        helpers must not reappear in normalization or attention code."""
         removed = [
             ("python/orthon/functional/math.py", "_scalar"),
             ("python/orthon/nn/layernorm.py", "_constant_like_shape"),
@@ -1139,44 +1067,29 @@ class TestSourceAudit:
         assert 'if device == "cuda":' in nccl          # backend: rank-0 default
 
     def test_cuda_storage_allocates_on_its_exact_device(self):
-        """Device memory never routes through the Allocator interface.
+        """Buffer and Storage allocate through the exact Runtime context.
 
-        Allocator serves host memory only. Storage calls get_allocator() inside
-        an is_cpu() branch and sends every CUDA allocation straight to
-        memory_pool_allocate(n_bytes, device) with the tensor's ACTUAL device,
-        so a cuda:N tensor cannot end up allocated on cuda:0.
+        Both Buffer and the native Storage compatibility adapter construct a
+        direct Allocation from the exact Runtime context. No CPU fallback or
+        legacy pointer-returning pool path serves CUDA tensors.
         """
-        storage = _strip_c_comments(_read("src/core/storage.cpp"))
-        ctor = storage[storage.index("Storage::Storage("):storage.index("Storage::~Storage")]
-        assert "if (device.is_cpu()) {\n        alloc = get_allocator(device);" in ctor
-        assert "memory_pool_allocate(n_bytes, device)" in ctor
-
-        # There is no device-side Allocator implementation to fall into.
-        alloc_cpp = _strip_c_comments(_read("src/memory/allocator.cpp"))
-        assert "CPUAllocator cpu_allocator" in alloc_cpp
-        assert "CUDAAllocator" not in alloc_cpp
-        for rel in ("include/orthon/memory/cuda_allocator.h",
-                    "src/memory/cuda_allocator.cpp"):
-            assert not os.path.exists(os.path.join(REPO, rel)), rel
-
-        # Nothing outside the allocator layer itself calls get_allocator.
-        callers = []
-        for root, _, files in os.walk(os.path.join(REPO, "src")):
-            for name in files:
-                if not name.endswith((".cpp", ".cu")):
-                    continue
-                rel = os.path.relpath(os.path.join(root, name), REPO).replace("\\", "/")
-                if rel == "src/memory/allocator.cpp":
-                    continue
-                if "get_allocator(" in _strip_c_comments(_read(rel)):
-                    callers.append(rel)
-        assert callers == ["src/core/storage.cpp"], callers
+        for rel in ("src/core/buffer.cpp", "src/core/storage.cpp"):
+            body = _strip_c_comments(_read(rel))
+            assert "default_runtime().allocator(device)->allocate(" in body
+            assert "memory_pool_allocate(" not in body
+        buffer = _strip_c_comments(_read("include/orthon/core/buffer.h"))
+        assert "Allocation allocation_" in buffer
+        assert "Storage" not in buffer
+        allocator = _strip_c_comments(_read("src/memory/allocator.cpp"))
+        assert "default_runtime().allocator(device)" in allocator
+        assert "std::make_shared<CPUAllocator>" in _read("src/runtime/cpu_context.cpp")
+        assert "std::make_shared<CUDAAllocator>(device," in _read("src/runtime/cuda_context.cpp")
 
     @requires_cuda
     def test_cuda_allocator_request_is_refused_rather_than_silently_served(self):
-        """A CUDA Allocator request is a programming error, not a fallback."""
-        alloc_cpp = _strip_c_comments(_read("src/memory/allocator.cpp"))
-        assert "throw std::runtime_error(" in alloc_cpp
-        # And real CUDA storage still lands on the requested device.
+        """Translate the old refusal assumption into exact CUDA ownership."""
+        allocator = _strip_c_comments(_read("src/memory/allocator.cpp"))
+        assert "default_runtime().allocator(device)" in allocator
+        assert "std::make_shared<CUDAAllocator>(device," in _read("src/runtime/cuda_context.cpp")
         t = ortho.zeros([4, 4]).to("cuda")
         assert t.device == ortho.Device("cuda:0")

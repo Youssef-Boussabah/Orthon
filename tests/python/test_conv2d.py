@@ -250,9 +250,12 @@ def test_conv2d_values_match_torch():
 
     w_d = orthon.zeros([C_out, C_in, K, K])
     for k, v in enumerate(w_flat):
-        f = k // (C_in * K * K); rem = k % (C_in * K * K)
-        c = rem // (K * K);      rem = rem % (K * K)
-        i = rem // K;            j = rem % K
+        f = k // (C_in * K * K)
+        rem = k % (C_in * K * K)
+        c = rem // (K * K)
+        rem = rem % (K * K)
+        i = rem // K
+        j = rem % K
         w_d.set_item([f, c, i, j], v)
 
     b_d = orthon.full([C_out], 0.5)
@@ -456,3 +459,67 @@ def test_conv2d_in_sequential():
     out = model(x)
     assert out.shape == (2, 4, 8, 8)
     assert out.requires_grad
+
+
+@pytest.mark.parametrize("route", ["conv2d", "_conv2d_direct", "_conv2d_im2col"])
+@pytest.mark.parametrize("spatial", [(0, 1, 0, 0), (1, 0, 0, 0), (-1, 1, 0, 0),
+                                    (1, -1, 0, 0), (1, 1, -1, 0), (1, 1, 0, -1)])
+def test_r1_conv2d_rejects_invalid_spatial_arguments(route, spatial):
+    with pytest.raises(ValueError):
+        getattr(orthon_c, route)(orthon.ones([1, 1, 3, 3]),
+                               orthon.ones([1, 1, 1, 1]), orthon.zeros([1]), *spatial)
+
+
+@pytest.mark.parametrize("route", ["conv2d", "_conv2d_direct", "_conv2d_im2col"])
+@pytest.mark.parametrize("stride", [1, 2])
+def test_r1_conv2d_rejects_kernel_larger_than_padded_input(route, stride):
+    with pytest.raises(ValueError, match="kernel exceeds"):
+        getattr(orthon_c, route)(orthon.ones([1, 1, 1, 1]),
+                               orthon.ones([1, 1, 2, 2]), orthon.zeros([1]), stride, stride)
+
+
+@pytest.mark.parametrize("route", ["conv2d", "_conv2d_direct", "_conv2d_im2col"])
+@pytest.mark.parametrize("weight_shape", [[1, 1, 0, 2], [1, 1, 2, 0]])
+def test_r1_conv2d_rejects_empty_kernel(route, weight_shape):
+    with pytest.raises(ValueError, match="positive"):
+        getattr(orthon_c, route)(orthon.ones([1, 1, 3, 3]),
+                               orthon.ones(weight_shape), orthon.zeros([1]))
+
+
+@pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not installed")
+@pytest.mark.parametrize("route", ["conv2d", "_conv2d_direct", "_conv2d_im2col"])
+@pytest.mark.parametrize("spatial", [(2, 3, 0, 1), (1, 2, 2, 0)])
+def test_r1_conv2d_asymmetric_geometry_matches_reference(route, spatial):
+    import torch.nn.functional as F
+    sh, sw, ph, pw = spatial
+    x = _make_tensor([1, 2, 7, 8], _deterministic_values(112, .07, 1), True)
+    w = _make_tensor([3, 2, 2, 3], _deterministic_values(36, .05, 3), True)
+    b = _make_tensor([3], [.2, -.1, .3], True)
+    tx = torch.tensor(x.tolist(), dtype=torch.float64).reshape(x.shape).requires_grad_(True)
+    tw = torch.tensor(w.tolist(), dtype=torch.float64).reshape(w.shape).requires_grad_(True)
+    tb = torch.tensor(b.tolist(), dtype=torch.float64).requires_grad_(True)
+    actual = getattr(orthon_c, route)(x, w, b, *spatial)
+    expected = F.conv2d(tx, tw, tb, stride=(sh, sw), padding=(ph, pw))
+    assert actual.shape == tuple(expected.shape)
+    assert actual.tolist() == pytest.approx(expected.detach().flatten().tolist(), abs=2e-6, rel=2e-5)
+    actual.sum().backward()
+    expected.sum().backward()
+    for value, reference in [(x, tx), (w, tw), (b, tb)]:
+        assert value.grad.tolist() == pytest.approx(reference.grad.flatten().tolist(), abs=2e-5, rel=2e-5)
+
+
+@pytest.mark.parametrize("stride", [(0, 1), (1, 0)])
+def test_r1_conv2d_zero_stride_is_a_managed_subprocess_error(stride):
+    import subprocess
+    import sys
+    code = f"""import orthon as o
+try:
+    o.conv2d(o.ones([1,1,2,2]), o.ones([1,1,1,1]), o.zeros([1]), {stride[0]}, {stride[1]})
+except ValueError:
+    print('REJECTED')
+else:
+    raise AssertionError('invalid stride admitted')
+"""
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "REJECTED"

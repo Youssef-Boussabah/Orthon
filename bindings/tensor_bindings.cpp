@@ -3,19 +3,20 @@
 #include <pybind11/stl.h>
 
 #include <orthon/core/tensor.h>
-#include <orthon/device/device_guard.h>
+#include <orthon/autograd/grad_mode.h>
+#include <orthon/ops/tensor_access.h>
 #include <orthon/core/tensor_impl.h>
 #include <orthon/core/dtype.h>
 #include <orthon/core/float_formats.h>
-#include <orthon/ops/cpu/binary_ops.h>
-#include <orthon/ops/cpu/scalar_ops.h>
-#include <orthon/ops/cpu/shape_ops.h>
-#include <orthon/ops/cpu/fill_ops.h>
-#include <orthon/ops/cpu/reduce_ops.h>
-#include <orthon/ops/cpu/unary_ops.h>
-#include <orthon/ops/cpu/matmul_ops.h>
-#include <orthon/ops/cpu/softmax_ops.h>
-#include <orthon/ops/cpu/cast_ops.h>
+#include <orthon/ops/binary_ops.h>
+#include <orthon/ops/scalar_ops.h>
+#include <orthon/ops/shape_ops.h>
+#include <orthon/ops/fill_ops.h>
+#include <orthon/ops/reduce_ops.h>
+#include <orthon/ops/unary_ops.h>
+#include <orthon/ops/matmul_ops.h>
+#include <orthon/ops/softmax_ops.h>
+#include <orthon/ops/cast_ops.h>
 #include <orthon/utils/logging.h>
 
 #include <cstring>
@@ -27,12 +28,6 @@
 #include <string>
 #include <vector>
 
-#ifdef WITH_CUDA
-#include <cuda_runtime_api.h>
-#include <orthon/ops/cuda/cast_kernels.h>
-#include <orthon/ops/cuda/unary_kernels.h>
-#endif
-
 namespace py = pybind11;
 
 // The framework's public API lives in namespace orthon; the extension module
@@ -40,7 +35,6 @@ namespace py = pybind11;
 // file-scope helpers below therefore name what they need explicitly rather
 // than importing the whole namespace here.
 using orthon::Device;
-using orthon::DeviceGuard;
 using orthon::DType;
 using orthon::Tensor;
 using orthon::TensorImpl;
@@ -50,11 +44,6 @@ using orthon::device_to_string;
 using orthon::dtype_size;
 using orthon::f16_bits_to_f32;
 
-#ifdef WITH_CUDA
-using orthon::cuda_copy_cast_float32_to_;
-using orthon::cuda_isfinite_all;
-using orthon::cuda_unscale_to_float32_and_check;
-#endif
 
 struct PyNumel {
     int64_t value;
@@ -106,36 +95,16 @@ static void copy_flat_range(Tensor& dst, int64_t dst_offset, const Tensor& src) 
         throw std::runtime_error("copy_flat_range: dtype mismatch");
     if (dst.device() != src.device())
         throw std::runtime_error("copy_flat_range: device mismatch");
-    if (dst_offset < 0 || dst_offset + src.numel() > dst.numel())
+    if (dst_offset < 0 || src.numel() < 0 || dst_offset > dst.numel() ||
+        src.numel() > dst.numel() - dst_offset)
         throw std::out_of_range("copy_flat_range: destination range out of bounds");
 
-    const size_t esz = dtype_size(dst.dtype());
-    char* dst_ptr = static_cast<char*>(dst.data()) + dst_offset * static_cast<int64_t>(esz);
-    const char* src_ptr = static_cast<const char*>(src.data());
-    const size_t nbytes = static_cast<size_t>(src.numel()) * esz;
-
-    if (nbytes > 0) {
-        if (dst.device().is_cuda()) {
-#ifdef WITH_CUDA
-            // Both pointers live on this device (equality is validated above),
-            // so it is the authoritative device for the copy.
-            DeviceGuard guard(dst.device());
-            cudaError_t err = cudaMemcpy(dst_ptr, src_ptr, nbytes, cudaMemcpyDeviceToDevice);
-            if (err != cudaSuccess)
-                throw std::runtime_error(std::string("CUDA error: ") + cudaGetErrorString(err));
-#else
-            throw std::runtime_error("copy_flat_range: CUDA is not available in this build");
-#endif
-        } else {
-            std::memcpy(dst_ptr, src_ptr, nbytes);
-        }
-    }
-
+    orthon::copy_range_values(dst, src, {dst_offset, 0, src.numel()});
     // This helper owns the destination bump for every caller that delegates
     // to it (_copy_flat_range_from, _copy_data_), so each logical copy bumps
     // exactly once. A zero-byte copy that passed validation is still a
     // successful logical mutation and bumps.
-    dst.impl()->storage()->bump_version();
+    dst.impl()->buffer()->bump_version();
 }
 
 static void copy_flat_range_to(const Tensor& src, int64_t src_offset, Tensor& dst) {
@@ -145,122 +114,30 @@ static void copy_flat_range_to(const Tensor& src, int64_t src_offset, Tensor& ds
         throw std::runtime_error("copy_flat_range_to: dtype mismatch");
     if (src.device() != dst.device())
         throw std::runtime_error("copy_flat_range_to: device mismatch");
-    if (src_offset < 0 || src_offset + dst.numel() > src.numel())
+    if (src_offset < 0 || dst.numel() < 0 || src_offset > src.numel() ||
+        dst.numel() > src.numel() - src_offset)
         throw std::out_of_range("copy_flat_range_to: source range out of bounds");
 
-    const size_t esz = dtype_size(src.dtype());
-    const char* src_ptr = static_cast<const char*>(src.data()) + src_offset * static_cast<int64_t>(esz);
-    char* dst_ptr = static_cast<char*>(dst.data());
-    const size_t nbytes = static_cast<size_t>(dst.numel()) * esz;
-
-    if (nbytes > 0) {
-        if (src.device().is_cuda()) {
-#ifdef WITH_CUDA
-            // Both pointers live on this device (equality is validated above),
-            // so it is the authoritative device for the copy.
-            DeviceGuard guard(src.device());
-            cudaError_t err = cudaMemcpy(dst_ptr, src_ptr, nbytes, cudaMemcpyDeviceToDevice);
-            if (err != cudaSuccess)
-                throw std::runtime_error(std::string("CUDA error: ") + cudaGetErrorString(err));
-#else
-            throw std::runtime_error("copy_flat_range_to: CUDA is not available in this build");
-#endif
-        } else {
-            std::memcpy(dst_ptr, src_ptr, nbytes);
-        }
-    }
-
+    orthon::copy_range_values(dst, src, {0, src_offset, dst.numel()});
     // The mutated tensor here is `dst` - the destination argument, not the
     // bound `self`. One bump per successful logical copy; zero-byte copies
     // that passed validation still bump.
-    dst.impl()->storage()->bump_version();
+    dst.impl()->buffer()->bump_version();
 }
 
 // The float16/bfloat16 read-back helpers come from
 // <orthon/core/float_formats.h>, so this file cannot decode a payload by a
 // different rule than the one that encoded it.
 
-static bool isfinite_all_impl(const Tensor& t) {
-    const DType dt = t.dtype();
-    if (dt != DType::Float32 && dt != DType::Float64 &&
-        dt != DType::Float16 && dt != DType::BFloat16) {
-        return true;
-    }
+static bool isfinite_all_impl(const Tensor& t) { return orthon::isfinite_all_values(t); }
 
-    if (t.device().is_cuda()) {
-#ifdef WITH_CUDA
-        return cuda_isfinite_all(t);
-#else
-        throw std::runtime_error("isfinite_all: CUDA is not available in this build");
-#endif
-    }
-
-    Tensor materialized = t;
-    auto finite_at = [&](int64_t off) -> bool {
-        if (dt == DType::Float32)
-            return std::isfinite(static_cast<const float*>(materialized.data())[off]);
-        if (dt == DType::Float64)
-            return std::isfinite(static_cast<const double*>(materialized.data())[off]);
-        if (dt == DType::Float16)
-            return std::isfinite(f16_bits_to_f32(
-                static_cast<const uint16_t*>(materialized.data())[off]));
-        return std::isfinite(bf16_bits_to_f32(
-            static_cast<const uint16_t*>(materialized.data())[off]));
-    };
-
-    const int64_t n = materialized.numel();
-    if (materialized.is_contiguous()) {
-        for (int64_t i = 0; i < n; ++i) {
-            if (!finite_at(i)) return false;
-        }
-        return true;
-    }
-
-    const auto& sh = materialized.shape();
-    const auto& st = materialized.strides();
-    const int ndim = static_cast<int>(sh.size());
-    if (ndim == 0) return finite_at(0);
-    std::vector<int64_t> idx(ndim, 0);
-    for (int64_t elem = 0; elem < n; ++elem) {
-        int64_t off = 0;
-        for (int d = 0; d < ndim; ++d) off += idx[d] * st[d];
-        if (!finite_at(off)) return false;
-        for (int d = ndim - 1; d >= 0; --d) {
-            if (++idx[d] < sh[d]) break;
-            idx[d] = 0;
-        }
-    }
-    return true;
-}
-
-static py::tuple amp_unscale_to_float32_and_check_impl(const Tensor& grad,
-                                                       float inv_scale) {
-    if (!grad.device().is_cuda()) {
-        throw std::runtime_error(
-            "_amp_unscale_to_float32_and_check: CUDA tensor required");
-    }
-#ifdef WITH_CUDA
-    auto result = cuda_unscale_to_float32_and_check(grad, inv_scale);
+static py::tuple amp_unscale_to_float32_and_check_impl(const Tensor& grad, float inv_scale) {
+    auto result = orthon::amp_unscale_values(grad, inv_scale);
     return py::make_tuple(result.first, result.second);
-#else
-    throw std::runtime_error(
-        "_amp_unscale_to_float32_and_check: CUDA is not available in this build");
-#endif
 }
 
 static void amp_copy_master_to_model_impl(Tensor& dst, const Tensor& src) {
-    if (!dst.device().is_cuda() || !src.device().is_cuda()) {
-        throw std::runtime_error("_amp_copy_master_to_model_: CUDA tensors required");
-    }
-#ifdef WITH_CUDA
-    cuda_copy_cast_float32_to_(dst, src);
-    // This wrapper is the one logical in-place API around the raw cast-copy
-    // kernel, so it owns the single destination bump.
-    dst.impl()->storage()->bump_version();
-#else
-    throw std::runtime_error(
-        "_amp_copy_master_to_model_: CUDA is not available in this build");
-#endif
+    orthon::amp_copy_values(dst, src);
 }
 
 // Resolve a single dimension index (supports negative), with a clear error.
@@ -292,43 +169,10 @@ static int64_t multi_index_offset(const Tensor& t,
     return offset;
 }
 
-// ---- Scalar element access across devices ----
-//
-// Neither accessor below may do the obvious thing:
-//
-//     static_cast<float*>(t.data())[offset]
-//
-// t.data() is a raw storage pointer. For a CUDA tensor it addresses DEVICE
-// memory, which the host cannot dereference - set_item, the full-index
-// __setitem__ and get_item would each terminate the process with an access
-// violation (0xC0000005) on a CUDA float32 tensor. The two helpers here route
-// the single element through the CUDA runtime instead.
-//
-// Both compute their element offset with multi_index_offset, which resolves
-// negative subscripts, bounds-checks every dimension and multiplies by the
-// tensor's own STRIDES - so a slice or transpose view writes/reads the element
-// its logical index names, and storage_offset is already folded into data().
-//
-// Supported dtype stays float32, matching the existing public contract: these
-// helpers make the operation safe, they do not widen it.
+// CUDA pointers cannot be dereferenced on the host: transfer one element
+// through the runtime. Compute the stride-relative offset after validating
+// indices; data() already includes the Tensor storage offset.
 
-#ifdef WITH_CUDA
-static void cuda_copy_scalar_float32(const Tensor& t,
-                                     int64_t element_offset,
-                                     void* host,
-                                     bool to_device,
-                                     const char* op) {
-    // Authoritative device: the tensor's own. One element, one copy.
-    DeviceGuard guard(t.device());
-    float* device_ptr = static_cast<float*>(t.data()) + element_offset;
-    cudaError_t err = to_device
-        ? cudaMemcpy(device_ptr, host, sizeof(float), cudaMemcpyHostToDevice)
-        : cudaMemcpy(host, device_ptr, sizeof(float), cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess)
-        throw std::runtime_error(std::string(op) + ": CUDA error: " +
-                                 cudaGetErrorString(err));
-}
-#endif
 
 static void write_scalar_float32(Tensor& t,
                                  const std::vector<int64_t>& indices,
@@ -338,25 +182,10 @@ static void write_scalar_float32(Tensor& t,
         throw std::runtime_error(std::string(op) + ": only float32 supported");
     const int64_t offset = multi_index_offset(t, indices);
 
-    if (t.device().is_cuda()) {
-#ifdef WITH_CUDA
-        cuda_copy_scalar_float32(t, offset, &value, /*to_device=*/true, op);
-#else
-        throw std::runtime_error(
-            std::string(op) + ": CUDA is not available in this build");
-#endif
-    } else if (t.device().is_cpu()) {
-        static_cast<float*>(t.data())[offset] = value;
-    } else {
-        throw std::runtime_error(std::string(op) + ": unsupported device");
-    }
-
-    // Exactly ONE bump, and only after the write actually landed. A
-    // rejected dtype, an out-of-range index and a failed cudaMemcpy all throw
-    // above, so a failed scalar assignment leaves the version counter alone.
-    // Views share the base Storage, so mutating through a CUDA slice or
-    // transpose advances the version every alias observes.
-    t.impl()->storage()->bump_version();
+    orthon::scalar_write_value(t, offset, value, op);
+    // Successful writes bump the shared Buffer once, including through views.
+    // Rejected assignments and failed transfers leave its version unchanged.
+    t.impl()->buffer()->bump_version();
 }
 
 static float read_scalar_float32(const Tensor& t,
@@ -366,32 +195,11 @@ static float read_scalar_float32(const Tensor& t,
         throw std::runtime_error(std::string(op) + ": only float32 supported");
     const int64_t offset = multi_index_offset(t, indices);
 
-    if (t.device().is_cuda()) {
-#ifdef WITH_CUDA
-        float value = 0.0f;
-        cuda_copy_scalar_float32(t, offset, &value, /*to_device=*/false, op);
-        return value;
-#else
-        throw std::runtime_error(
-            std::string(op) + ": CUDA is not available in this build");
-#endif
-    }
-    if (!t.device().is_cpu())
-        throw std::runtime_error(std::string(op) + ": unsupported device");
-    return static_cast<const float*>(t.data())[offset];
+    return orthon::scalar_read_value(t, offset, op);
 }
 
-// ---- Raw tensor byte codec ----
-//
-// The two halves of the checkpoint format's tensor payload. They move BYTES:
-// no Python list of floats in the middle, no NumPy dtype table, no rounding.
-// That is what makes a stored float16/bfloat16 payload survive a round trip
-// bit-for-bit regardless of what the host conversion rules do, and what lets a
-// signalling NaN keep its payload - a Tensor -> Python float -> NumPy pipeline
-// quiets it to 0x7FC00001 and cannot do better.
-//
-// Only the logical tensor payload crosses: no TensorImpl pointer, no allocator
-// bookkeeping, no Storage capacity, no autograd metadata, no version counter.
+// Checkpoint payloads preserve raw bits, including NaNs and low-precision
+// values. Export only logical tensor data, excluding capacity and pointers.
 
 // Multiply with an explicit overflow check. Returns false if the product would
 // not fit, so a malformed archive claiming an absurd shape is rejected BEFORE
@@ -469,33 +277,15 @@ static Tensor tensor_from_bytes_impl(const std::vector<int64_t>& shape,
     return out;
 }
 
-// ---- Python scalar operands for the Tensor arithmetic operators ----
-//
-// Deliberately NOT arbitrary Python object coercion. `obj` qualifies only if it
-// is a real NUMBER: int, float, bool, or an object exposing the number protocol
-// with a working __float__ / __index__ (numpy scalars, Decimal, Fraction). A
-// str, bytes, list, dict, complex or plain object is rejected here.
-//
-// Rejection is reported to the CALLER as "not a scalar" rather than thrown,
-// because the operator then answers NotImplemented and lets Python raise its
-// own canonical message:
-//
-//     TypeError: unsupported operand type(s) for +: 'Tensor' and 'str'
-//
-// Letting pybind11 reject the argument instead would dump an overload table
-// ("__add__(): incompatible function arguments. The following argument types
-// are supported: ...") for every non-Tensor right-hand side.
+// Accept Python numeric protocols, including NumPy scalars. Return
+// NotImplemented for complex or nonnumeric operands so Python raises its
+// normal arithmetic TypeError instead of a pybind overload error.
 static bool as_python_scalar(py::handle obj, double& out) {
     PyObject* p = obj.ptr();
     if (py::isinstance<Tensor>(obj)) return false;
-    // A NumPy ARRAY is not a scalar, and the number protocol cannot be trusted
-    // to say so: NumPy 1.25+ only DEPRECATES float(one_element_array), so
-    // PyFloat_AsDouble succeeds on some NumPy versions and raises on others,
-    // version-forking this contract. Decide on dimensionality instead: any
-    // ndarray with ndim >= 1 (a size-1 array included) is rejected here, while
-    // a 0-d ndarray carries exactly one value and stays accepted. NumPy scalar
-    // objects (np.float32(...), np.int64(...)) are not ndarray instances and
-    // fall through to the number-protocol path unchanged.
+    // Array-to-float conversion varies across NumPy versions. Check ndim
+    // directly: reject arrays with ndim >= 1, including size-one arrays.
+    // Zero-dimensional arrays and NumPy scalar objects remain numeric operands.
     if (py::isinstance<py::array>(obj)) {
         if (py::reinterpret_borrow<py::array>(obj).ndim() > 0) return false;
     }
@@ -558,20 +348,9 @@ void bind_tensor(py::module_& m) {
 
     py::class_<Tensor> tensor_class(m, "Tensor");
 
-    // Opt out of NumPy's binary ufunc protocol.
-    //
-    // The arithmetic operators below answer NotImplemented for a non-numeric
-    // right-hand side so Python can raise its own canonical operand TypeError.
-    // NumPy, however, accepts ANY object in its reflected operators and falls
-    // back to an OBJECT-dtype array, so without this opt-out
-    // `x + np.array([1., 2., 3.])` quietly yields
-    // array([Tensor, Tensor, Tensor], dtype=object) instead of failing.
-    //
-    // Setting __array_ufunc__ to None is NumPy's documented opt-out: its
-    // ufuncs return NotImplemented for any expression involving this type, so
-    // the mixed expression raises TypeError from Python, in both operand
-    // orders. Numeric numpy SCALARS (np.float32, np.int64, a 0-d array) are
-    // unaffected: as_python_scalar converts them before NumPy is ever asked.
+    // Opt out of NumPy ufuncs to prevent reflected array arithmetic from
+    // producing object arrays of Tensor objects. Direct numeric scalar
+    // arithmetic still follows the Tensor scalar protocol.
     tensor_class.attr("__array_ufunc__") = py::none();
 
     tensor_class
@@ -596,11 +375,11 @@ void bind_tensor(py::module_& m) {
         .def_property_readonly("_impl_id", [](const Tensor& t) {
             return reinterpret_cast<uintptr_t>(t.impl().get());
         })
-        // Internal diagnostic: the shared Storage's in-place mutation
+        // Internal diagnostic: the shared Buffer's in-place mutation
         // generation. Read-only, underscore-private, exists so tests can prove
         // exactly-once bump semantics; not a public versioning API.
         .def_property_readonly("_storage_version", [](const Tensor& t) {
-            return t.impl()->storage()->version();
+            return t.impl()->buffer()->version();
         })
         // Autograd metadata.
         .def_property_readonly("requires_grad", &Tensor::requires_grad)
@@ -621,6 +400,12 @@ void bind_tensor(py::module_& m) {
                 hook();
             });
         }, py::arg("hook"))
+        .def("_register_backward_finalizer", [](Tensor& self, uintptr_t key, py::function callback) {
+            self.register_backward_finalizer(key, [callback]() {
+                py::gil_scoped_acquire gil;
+                callback();
+            });
+        }, py::arg("key"), py::arg("callback"))
         .def_property_readonly("_has_grad_fn", &Tensor::has_grad_fn)
         .def("backward", &Tensor::backward, py::arg("retain_graph") = false)
         // Scalar and bulk reads.
@@ -742,19 +527,9 @@ void bind_tensor(py::module_& m) {
         .def("_copy_flat_range_to", [](const Tensor& self, int64_t offset, Tensor& destination) {
             copy_flat_range_to(self, offset, destination);
         }, py::arg("offset"), py::arg("destination"))
-        // Internal exact-data copy used by Module.load_state_dict.
-        //
-        // Copies `source`'s payload into this tensor's existing storage. The
-        // TensorImpl is not replaced, so the destination keeps its object
-        // identity and every piece of bookkeeping hanging off it: autograd
-        // metadata, requires_grad, is_leaf, .grad, registered hooks, optimizer
-        // references and module registration. Only the stored values change.
-        //
-        // Deliberately narrow: exact shape, dtype, device and a contiguous
-        // destination. Every canonical module parameter satisfies that, and the
-        // actual transfer reuses copy_flat_range so the CUDA path stays inside
-        // the one DeviceGuard-protected memcpy helper rather than growing a
-        // second copy of that logic.
+        // Copy exact shape/dtype/device contiguous values while retaining the
+        // TensorImpl owner and its gradient, hooks and optimizer bindings. Module
+        // state loading partitions strided destinations into contiguous subviews.
         .def("_copy_data_", [](Tensor& self, const Tensor& source) {
             if (self.shape() != source.shape())
                 throw std::runtime_error(
@@ -779,6 +554,28 @@ void bind_tensor(py::module_& m) {
                     "_copy_data_: source must be contiguous");
             copy_flat_range(self, 0, source);
         }, py::arg("source"))
+        // Keep the canonical representation alive while Module rebinds its
+        // registered owner. The separate facade copies neither values nor history.
+        .def("_model_value_reference", [](const Tensor& self) {
+            if (orthon::is_grad_enabled())
+                throw std::runtime_error("model value reference requires no_grad");
+            return Tensor(self);
+        })
+        // Private Module-only value adoption. Tensor's ordinary assignment
+        // adopts the canonical shared TensorImpl; no payload, allocator or
+        // autograd owner is duplicated. The bound Python facade stays alive.
+        // This is model state, not an unrestricted Tensor.data setter.
+        .def("_rebind_model_value_", [](Tensor& self, const Tensor& value) {
+            if (orthon::is_grad_enabled())
+                throw std::runtime_error("model value rebind requires no_grad");
+            if (self.shape() != value.shape())
+                throw std::runtime_error("model value rebind: shape mismatch");
+            if (!value.is_leaf() || value.has_grad_fn())
+                throw std::runtime_error("model value rebind requires a graph-free leaf");
+            if (self.requires_grad() != value.requires_grad())
+                throw std::runtime_error("model value rebind: requires_grad mismatch");
+            self = value;
+        }, py::arg("value"))
         // set_item: multi-dimensional index → write scalar float in-place
         .def("set_item", [](Tensor& t, std::vector<int64_t> indices, float value) {
             write_scalar_float32(t, indices, value, "set_item");
@@ -802,9 +599,8 @@ void bind_tensor(py::module_& m) {
             const auto& sh = t.shape();
             for (int64_t i = 0; i < start_dim; ++i)
                 new_shape.push_back(sh[static_cast<size_t>(i)]);
-            int64_t flat = 1;
-            for (int64_t i = start_dim; i <= end_dim; ++i)
-                flat *= sh[static_cast<size_t>(i)];
+            const int64_t flat = Layout::shape_numel(std::vector<int64_t>(
+                sh.begin() + start_dim, sh.begin() + end_dim + 1));
             new_shape.push_back(flat);
             for (int64_t i = end_dim + 1; i < ndim; ++i)
                 new_shape.push_back(sh[static_cast<size_t>(i)]);
@@ -813,13 +609,9 @@ void bind_tensor(py::module_& m) {
         .def("transpose", [](const Tensor& t, int64_t dim0, int64_t dim1) {
             return transpose(t, dim0, dim1);
         }, py::arg("dim0"), py::arg("dim1"))
-        // Thin exposure of the already-existing native Tensor::slice. This is
-        // not a redesign of Python indexing: __getitem__ keeps its integer /
-        // tuple / list semantics and still rejects Python slice objects, and
-        // there is deliberately no step, omitted bound, Ellipsis or advanced
-        // indexing here. Bounds follow the native contract (negative dim/start/
-        // end are normalised, everything else is an error) rather than Python's
-        // clamping slice rules.
+        // Explicit bounds follow the native slice contract: normalize negative
+        // dim/start/end, then validate without Python slice clamping.
+        // __getitem__ supports integer indices only.
         .def("slice", [](const Tensor& t, int64_t dim, int64_t start, int64_t end) {
             return t.slice(dim, start, end);
         }, py::arg("dim"), py::arg("start"), py::arg("end"),
@@ -865,15 +657,8 @@ void bind_tensor(py::module_& m) {
                 // one version bump.
                 write_scalar_float32(t, indices, value, "__setitem__");
             } else {
-                // Partial assignment fills a whole sub-view, and the only
-                // fill primitive in the runtime is the CPU fill_. A CUDA
-                // tensor is rejected explicitly HERE, before any sub-view is
-                // built, so nothing partial is attempted first and the error
-                // names __setitem__ rather than an internal helper.
-                //
-                // A stride-aware CUDA fill kernel is what would lift this
-                // limit. Full-index CUDA scalar assignment above works, and
-                // CPU partial assignment is unaffected.
+                // Reject partial CUDA assignment before constructing a view. CPU supports
+                // partial fill; full-index CUDA assignment uses the runtime transfer path.
                 if (t.device().is_cuda())
                     throw std::runtime_error(
                         "__setitem__: partial CUDA assignment is not supported");
@@ -932,13 +717,8 @@ void bind_tensor(py::module_& m) {
         .def("matmul",    [](const Tensor& a, const Tensor& b) { return matmul(a, b); },
              py::arg("other"))
         .def("__neg__",   [](const Tensor& t) { return neg(t); })
-        // One typed dispatch per operator rather than a pile of pybind
-        // overloads.
-        //
-        // Tensor-Tensor is checked first. A NUMBER routes to the scalar path.
-        // Anything else answers NotImplemented, which hands the decision back
-        // to Python: it tries the reflected operator and, failing that, raises
-        // the standard operand-type TypeError.
+        // Prefer Tensor dispatch, then numeric scalars. NotImplemented lets
+        // Python try the reflected operator and raise its standard TypeError.
         .def("__add__", [](const Tensor& a, py::object other) -> py::object {
             if (py::isinstance<Tensor>(other))
                 return py::cast(add(a, other.cast<Tensor>()));
@@ -960,7 +740,7 @@ void bind_tensor(py::module_& m) {
             return py_not_implemented();
         })
         .def("__rsub__", [](const Tensor& a, py::object other) -> py::object {
-            // NOT commutative: this is `other - a`.
+            // not commutative: this is `other - a`.
             double v;
             if (as_python_scalar(other, v)) return py::cast(scalar_rsub(v, a));
             return py_not_implemented();
@@ -985,7 +765,7 @@ void bind_tensor(py::module_& m) {
             return py_not_implemented();
         })
         .def("__rtruediv__", [](const Tensor& a, py::object other) -> py::object {
-            // NOT commutative: this is `other / a`, the one scalar form whose
+            // not commutative: this is `other / a`, the one scalar form whose
             // backward genuinely depends on a's values.
             double v;
             if (as_python_scalar(other, v)) return py::cast(scalar_rdiv(v, a));

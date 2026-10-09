@@ -1,5 +1,5 @@
 #include <gtest/gtest.h>
-#include <orthon/ops/cpu/fill_ops.h>
+#include <orthon/ops/fill_ops.h>
 #include <orthon/core/tensor_impl.h>
 
 // The framework's public API lives in namespace orthon. Tests import it wholesale

@@ -1,26 +1,8 @@
-"""Scalar arithmetic, sub/div, and float64 scalar precision.
+"""Scalar arithmetic preserves Tensor dtype, device and rank-0 constant storage.
 
-The public arithmetic surface is `add`, `sub`, `mul`, `div`, `neg` and
-`matmul` between tensors, plus a Python number on either side::
-
-    x - y      x / y
-    x + 2.0    2.0 + x        x - 2.0    2.0 - x
-    x * 2.0    2.0 * x        x / 2.0    2.0 / x
-
-The load-bearing design decisions pinned here:
-
-  * TENSOR-AUTHORITATIVE scalars. The Python number takes the tensor's dtype
-    and exact Device. No promotion lattice; a float32 tensor is never widened
-    because a Python float is a C double.
-  * RANK-0 representation. The hidden constant has shape [] and O(1) storage,
-    and rides existing broadcasting - never a data-shaped constant tensor.
-  * FULL-PRECISION narrowing. `full()` takes a double and narrows once, at the
-    destination dtype; narrowing through float32 first caps float64
-    mean-backward precision at 0.1666666716337204.
-  * SELECTIVE version tracking. `x * 3` does not watch x, because d/dx is 3;
-    `3 / x` does, because d/dx is -3/x^2. Scalar convenience must not become a
-    blanket mutation rejection.
-"""
+Float64 narrowing and selective mutation watches distinguish x / s from s / x."""
+from tests.support.source import REPO_ROOT
+from tests.support.capabilities import orthon_cuda_available
 import numpy as np
 import pytest
 
@@ -28,7 +10,7 @@ import orthon as ortho
 
 torch = pytest.importorskip("torch")
 
-CUDA = ortho.cuda_enabled()
+CUDA = orthon_cuda_available()
 requires_cuda = pytest.mark.skipif(not CUDA, reason="CUDA not available")
 
 CPU_DTYPES = ["float32", "float64"]
@@ -103,10 +85,7 @@ VALUES = [1.5, -2.25, 3.0, 0.75, -4.5, 2.0]
 UPSTREAM = [0.3, -1.7, 2.1, 0.9, -0.4, 1.25]
 
 
-# ---------------------------------------------------------------------------
 # the public API exists and is not aliased twice.
-# ---------------------------------------------------------------------------
-
 def test_top_level_sub_and_div_exist():
     assert callable(ortho.sub)
     assert callable(ortho.div)
@@ -126,42 +105,46 @@ def test_no_redundant_method_aliases():
         assert not hasattr(ortho.Tensor, name), name
 
 
-# ---------------------------------------------------------------------------
 # scalar representation contract.
-# ---------------------------------------------------------------------------
-
 @pytest.mark.parametrize("dtype", CPU_DTYPES)
 def test_scalar_operand_is_rank0_and_untracked(dtype):
     ref = _make(VALUES, dtype=dtype, grad=True)
-    s = ortho._scalar_like(ref, 2.5)
-    assert tuple(s.shape) == ()            # NOT full(list(ref.shape), 2.5)
-    assert int(s.numel) == 1               # O(1), not O(ref.numel())
-    assert s.dtype == ref.dtype
-    assert s.device == ref.device
-    assert s.requires_grad is False
-    assert s._has_grad_fn is False
-    assert s.is_leaf is True
-    assert s.item() == pytest.approx(2.5)
+    # Native ScalarLike tests pin the hidden constant's rank/storage/graph.
+    # The retired diagnostic is replaced here by its public autograd contract.
+    result = ref * 2.5
+    assert result.dtype == ref.dtype and result.device == ref.device
+    result.sum().backward()
+    assert ref.grad.tolist() == pytest.approx([2.5] * len(VALUES))
+    with ortho.no_grad():
+        untracked = ref + 2.5
+    assert not untracked.requires_grad and not untracked._has_grad_fn
 
 
 def test_scalar_storage_is_o1_regardless_of_tensor_size():
-    small = ortho.zeros([1])
-    large = ortho.zeros([4096])
-    assert int(ortho._scalar_like(small, 1.0).numel) == 1
-    assert int(ortho._scalar_like(large, 1.0).numel) == 1
+    from pathlib import Path
+    from tests.support.source import function
+    code = (REPO_ROOT / "src/ops/scalar_ops.cpp").read_text()
+    body = function(code, "scalar_like")
+    assert "full({}, value, reference.dtype(), Device{})" in body
+    assert "NoGradGuard guard" in body
+    assert "scalar.to(reference.device())" in body
+    assert "reference.shape()" not in body and "reference.numel()" not in body
+    for size in (1, 4096):
+        out = ortho.zeros([size]) + 1.
+        assert out.tolist() == [1.] * size
 
 
 def test_scalar_dtype_is_tensor_authoritative_not_python_double():
-    """A float32 tensor is NOT promoted because Python floats are doubles."""
+    """A float32 tensor is not promoted because Python floats are doubles."""
     f32 = ortho.zeros([2], dtype="float32")
-    s = ortho._scalar_like(f32, 1.0 / 3.0)
+    s = f32 + 1.0 / 3.0
     assert s.dtype == "float32"
-    assert s.item() == np.float32(1.0 / 3.0)
+    assert s.tolist() == [np.float32(1.0 / 3.0)] * 2
 
     f64 = ortho.from_numpy(np.zeros(2, dtype=np.float64))
-    s64 = ortho._scalar_like(f64, 1.0 / 3.0)
+    s64 = f64 + 1.0 / 3.0
     assert s64.dtype == "float64"
-    assert s64.item() == 1.0 / 3.0         # exact double, no float32 hop
+    assert s64.tolist() == [1.0 / 3.0] * 2  # exact double, no float32 hop
 
 
 @pytest.mark.parametrize("dtype", CPU_DTYPES)
@@ -177,18 +160,12 @@ def test_scalar_ops_preserve_tensor_dtype(dtype):
 @pytest.mark.parametrize("dtype", CUDA_DTYPES)
 def test_cuda_scalar_operand_uses_exact_device(dtype):
     x = _make(VALUES, dtype=dtype, device="cuda")
-    s = ortho._scalar_like(x, 2.0)
-    assert s.device == x.device            # cuda:N, not the bare "cuda" -> cuda:0
-    assert s.device.is_cuda()
-    assert s.dtype == dtype
-    assert tuple(s.shape) == ()
-    assert (x * 2.0).device == x.device
+    for s in (x + 2., 2. + x, x - 2., 2. - x, x * 2., 2. * x, x / 2., 2. / x):
+        assert s.device == x.device and s.device.is_cuda()
+        assert s.dtype == dtype and s.shape == x.shape
 
 
-# ---------------------------------------------------------------------------
 # Tensor-Tensor sub and div, against PyTorch.
-# ---------------------------------------------------------------------------
-
 def _pair(dtype, device):
     a = _make(VALUES, dtype, device, grad=True)
     b = _make([2.0, -1.5, 4.0, 0.5, -2.0, 3.25], dtype, device, grad=True)
@@ -293,11 +270,8 @@ def test_division_by_zero_preserves_floating_semantics():
     assert np.isnan(ref[2])
 
 
-# ---------------------------------------------------------------------------
 # scalar forward and autograd, against PyTorch, with a NON-UNIFORM
 # upstream gradient so a constant-folding mistake cannot hide.
-# ---------------------------------------------------------------------------
-
 SCALAR_CASES = [
     ("x + s", lambda x, s: x + s, lambda x, s: x + s),
     ("s + x", lambda x, s: s + x, lambda x, s: s + x),
@@ -381,10 +355,7 @@ def test_integer_scalars_and_bools_are_accepted():
     assert (x * np.float32(3)).tolist() == pytest.approx([3.0, 6.0])
 
 
-# ---------------------------------------------------------------------------
 # scalar operators compose with logical views.
-# ---------------------------------------------------------------------------
-
 VIEW_CASES = [
     ("transpose * 2", lambda b: b.transpose(0, 1) * 2.0,
      lambda b: b.transpose(0, 1) * 2.0),
@@ -468,11 +439,8 @@ def test_scalar_on_view_adds_no_hidden_public_node():
     assert view._impl_id != base._impl_id
 
 
-# ---------------------------------------------------------------------------
 # Version selectivity: a node watches only what its backward reads, which is
 # the reason the scalar ops do not reuse the generic MulNode.
-# ---------------------------------------------------------------------------
-
 ALLOWED_AFTER_MUTATION = [
     ("x + 3", lambda x: x + 3.0),
     ("3 + x", lambda x: 3.0 + x),
@@ -489,7 +457,7 @@ def test_mutation_after_forward_is_allowed_when_backward_ignores_values(name, bu
     x = _make(VALUES, grad=True)
     y = build(x)
     x.set_item([0], 99.0)
-    ortho.sum(y).backward()                    # must NOT raise
+    ortho.sum(y).backward()                    # must not raise
     assert x.grad is not None, name
 
 
@@ -544,10 +512,7 @@ def test_tensor_tensor_sub_allows_mutation():
     assert b.grad.tolist() == [-1.0] * len(VALUES)
 
 
-# ---------------------------------------------------------------------------
 # error contract.
-# ---------------------------------------------------------------------------
-
 @pytest.mark.parametrize("other", ["abc", b"abc", [1, 2, 3], {"a": 1},
                                    object(), None, 1j])
 @pytest.mark.parametrize("op", ["add", "sub", "mul", "truediv"])
@@ -575,15 +540,8 @@ def test_type_error_message_names_the_operands():
 
 
 def test_numpy_arrays_are_not_silently_coerced():
-    """A NumPy ARRAY is not a scalar, and must not become an object array.
-
-    The operators answer NotImplemented for a non-numeric operand so Python can
-    raise its canonical message. NumPy's reflected operators accept anything and
-    fall back to an object-dtype array, so without an explicit opt-out
-    `x + np.array([1., 2., 3.])` yields array([Tensor, Tensor, Tensor],
-    dtype=object) instead of failing. Tensor sets __array_ufunc__ = None,
-    NumPy's documented opt-out.
-    """
+    """Tensor opts out of NumPy ufuncs so reflected array arithmetic raises TypeError
+    instead of silently creating an object array of Tensor values."""
     assert ortho.Tensor.__array_ufunc__ is None
     x = _make([1.0, 2.0, 3.0])
     arr = np.array([1.0, 2.0, 3.0], dtype=np.float32)
@@ -648,10 +606,7 @@ def test_cross_device_operands_still_rejected():
         cpu / gpu
 
 
-# ---------------------------------------------------------------------------
 # grad mode and leaf metadata.
-# ---------------------------------------------------------------------------
-
 @pytest.mark.parametrize("build", [
     lambda x: x + 1.0, lambda x: 1.0 - x, lambda x: x * 2.0, lambda x: 2.0 / x,
 ])
@@ -693,10 +648,7 @@ def test_leaf_metadata_survives_scalar_backward():
     assert x.grad.is_leaf is True
 
 
-# ---------------------------------------------------------------------------
 # factory precision.
-# ---------------------------------------------------------------------------
-
 def test_full_float64_keeps_the_full_double():
     assert ortho.full([], 1.0 / 3.0, dtype="float64").item() == 1.0 / 3.0
     pi = 3.141592653589793
@@ -741,10 +693,7 @@ def test_ones_and_zeros_unchanged():
     assert ortho.zeros([2]).tolist() == [0.0, 0.0]
 
 
-# ---------------------------------------------------------------------------
 # float64 mean backward precision.
-# ---------------------------------------------------------------------------
-
 @pytest.mark.parametrize("factor", [3, 6, 7, 1000])
 def test_float64_mean_backward_scale_is_exact_double(factor):
     x = ortho.from_numpy(np.ones(factor, dtype=np.float64))

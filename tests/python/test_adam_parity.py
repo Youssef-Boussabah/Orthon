@@ -1,7 +1,6 @@
+from tests.support.examples import load_example
+from tests.support.capabilities import orthon_cuda_available
 import pytest
-import importlib.util
-import sys
-from pathlib import Path
 
 import orthon
 from orthon.optim import Adam
@@ -69,20 +68,6 @@ def _adam_one_step_torch(shape, grad, device, lr=1e-5, eps=1e-6):
     return after, _stats(updates)
 
 
-def _load_cifar_example():
-    root = Path(__file__).resolve().parents[2]
-    examples_dir = root / "examples"
-    sys.path.insert(0, str(examples_dir))
-    try:
-        spec = importlib.util.spec_from_file_location(
-            "cifar10_cnn_example",
-            examples_dir / "cifar10_cnn.py",
-        )
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module
-    finally:
-        sys.path.remove(str(examples_dir))
 
 
 def _param_update_stats(param, before):
@@ -121,7 +106,7 @@ def test_adam_one_step_matches_torch_cpu_simple():
 
 
 def test_adam_one_step_matches_torch_cuda_simple():
-    if not orthon.cuda_enabled() or not torch.cuda.is_available():
+    if not orthon_cuda_available() or not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
     p_d = orthon.full([2, 3], 0.5).to("cuda")
@@ -162,7 +147,7 @@ def test_adam_one_step_matches_torch_cpu_large_linear_weight_shape():
 
 
 def test_adam_one_step_matches_torch_cuda_large_linear_weight_shape():
-    if not orthon.cuda_enabled() or not torch.cuda.is_available():
+    if not orthon_cuda_available() or not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
     shape = (512, 64)
@@ -179,10 +164,10 @@ def test_adam_one_step_matches_torch_cuda_large_linear_weight_shape():
 
 
 def test_adam_cifar_first_linear_weight_update_stats_match_cpu_cuda():
-    if not orthon.cuda_enabled() or not torch.cuda.is_available():
+    if not orthon_cuda_available() or not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
-    cifar = _load_cifar_example()
+    cifar = load_example("cifar10_cnn.py")
     try:
         train_loader, _ = cifar.build_cifar10_loaders(
             "data",
@@ -207,7 +192,7 @@ def test_adam_cifar_first_linear_weight_update_stats_match_cpu_cuda():
         param4 = params[4]
         before = flatten_nested(param4.to("cpu").tolist())
 
-        x = cifar.orthon_tensor_from_images(images, device)
+        x = _orthon_from_torch(images, device)
         loss = orthon.cross_entropy(model(x), targets)
         loss.backward()
         Adam(model.parameters(), lr=1e-5, betas=(0.9, 0.999), eps=1e-6).step()

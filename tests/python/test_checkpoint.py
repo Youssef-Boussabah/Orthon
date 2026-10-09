@@ -1,12 +1,5 @@
-"""Checkpoint BEHAVIOUR: model/optimizer round-trips, resume, devices.
-
-The container format itself (raw byte codec, manifest, determinism, corruption
-handling, path safety) is covered by test_checkpoint_format.py.
-
-Round-trips are asserted on EXACT bytes rather than approximate values: the
-codec moves raw storage, so there is no reason for a saved value to come back
-merely close to what was written.
-"""
+"""Checkpoint model/optimizer round trips, resume and exact-device restoration."""
+from tests.support.capabilities import orthon_cuda_available
 from pathlib import Path
 from uuid import uuid4
 
@@ -19,7 +12,7 @@ from orthon.nn import BatchNorm1d, Linear, ReLU, Sequential
 from orthon.optim import Adam, SGD
 
 
-CUDA = ortho.cuda_enabled()
+CUDA = orthon_cuda_available()
 
 
 def _checkpoint_path(name):
@@ -222,8 +215,8 @@ def test_checkpoint_sgd_state_roundtrip():
 
     assert metadata == {}
     assert restored_optimizer.get_lr() == pytest.approx(0.05)
-    assert restored_optimizer._weight_decay == pytest.approx(0.1)
-    assert restored_optimizer._decay_bias is True
+    assert restored_optimizer.state_dict()["weight_decay"] == pytest.approx(0.1)
+    assert restored_optimizer.state_dict()["decay_bias"] is True
 
 
 def test_checkpoint_adam_state_roundtrip():
@@ -242,16 +235,16 @@ def test_checkpoint_adam_state_roundtrip():
         path.unlink(missing_ok=True)
 
     assert restored_optimizer.get_lr() == pytest.approx(0.01)
-    assert restored_optimizer._t == optimizer._t
-    assert restored_optimizer._eps == optimizer._eps
-    assert restored_optimizer._beta1 == optimizer._beta1
-    assert restored_optimizer._beta2 == optimizer._beta2
-    assert restored_optimizer._weight_decay == optimizer._weight_decay
-    assert restored_optimizer._decay_bias == optimizer._decay_bias
-    for got, expected in zip(restored_optimizer._m, optimizer._m):
+    assert restored_optimizer.state_dict()["t"] == optimizer.state_dict()["t"]
+    assert restored_optimizer.state_dict()["eps"] == optimizer.state_dict()["eps"]
+    assert restored_optimizer.state_dict()["betas"][0] == optimizer.state_dict()["betas"][0]
+    assert restored_optimizer.state_dict()["betas"][1] == optimizer.state_dict()["betas"][1]
+    assert restored_optimizer.state_dict()["weight_decay"] == optimizer.state_dict()["weight_decay"]
+    assert restored_optimizer.state_dict()["decay_bias"] == optimizer.state_dict()["decay_bias"]
+    for got, expected in zip(restored_optimizer.state_dict()["m"], optimizer.state_dict()["m"]):
         assert got is not None
         assert _raw(got) == _raw(expected)         # exact, not approx
-    for got, expected in zip(restored_optimizer._v, optimizer._v):
+    for got, expected in zip(restored_optimizer.state_dict()["v"], optimizer.state_dict()["v"]):
         assert got is not None
         assert _raw(got) == _raw(expected)
 
@@ -285,8 +278,8 @@ def test_checkpoint_adam_uninitialised_moments_round_trip():
         ortho.load_checkpoint(path, model=restored_model, optimizer=restored)
     finally:
         path.unlink(missing_ok=True)
-    assert restored._m == [None] * len(list(restored_model.parameters()))
-    assert restored._t == 0
+    assert restored.state_dict()["m"] == [None] * len(list(restored_model.parameters()))
+    assert restored.state_dict()["t"] == 0
 
 
 def test_checkpoint_resume_training_matches_continuous_adam_path():
@@ -344,12 +337,12 @@ def test_checkpoint_resume_is_bit_exact_and_matches_the_loss_trajectory():
         path.unlink(missing_ok=True)
 
     assert metadata == {"step": 4}
-    assert resumed_optimizer._t == optimizer._t
+    assert resumed_optimizer.state_dict()["t"] == optimizer.state_dict()["t"]
     assert resumed_losses == continuous_losses
     _assert_model_states_bit_identical(model, resumed_model)
-    for got, expected in zip(resumed_optimizer._m, optimizer._m):
+    for got, expected in zip(resumed_optimizer.state_dict()["m"], optimizer.state_dict()["m"]):
         assert _raw(got) == _raw(expected)
-    for got, expected in zip(resumed_optimizer._v, optimizer._v):
+    for got, expected in zip(resumed_optimizer.state_dict()["v"], optimizer.state_dict()["v"]):
         assert _raw(got) == _raw(expected)
 
 
@@ -376,8 +369,7 @@ def test_checkpoint_sgd_resume_matches_continuous_path():
     _assert_model_states_bit_identical(model, resumed_model)
 
 
-# ---- map_location ----
-
+# map_location
 def test_load_state_dict_default_preserves_the_models_devices():
     """The destination is authoritative: loading never moves a model."""
     model = _make_model()
@@ -453,8 +445,8 @@ def test_map_location_moves_the_model_and_the_optimizer_state():
     finally:
         path.unlink(missing_ok=True)
     assert all(p.device.is_cuda() for p in destination.parameters())
-    assert all(m.device.is_cuda() for m in destination_optimizer._m)
-    assert all(v.device.is_cuda() for v in destination_optimizer._v)
+    assert all(m.device.is_cuda() for m in destination_optimizer.state_dict()["m"])
+    assert all(v.device.is_cuda() for v in destination_optimizer.state_dict()["v"])
     _assert_model_states_bit_identical(model, destination)
 
 

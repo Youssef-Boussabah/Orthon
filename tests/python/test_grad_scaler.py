@@ -1,4 +1,5 @@
 """Tests for GradScaler (static loss scaling)."""
+from tests.support.capabilities import orthon_cuda_available
 import pytest
 import numpy as np
 
@@ -8,7 +9,7 @@ from orthon.nn.module import Module
 from orthon.optim import SGD, Adam
 from orthon.amp import MixedPrecisionOptimizer, GradScaler
 
-CUDA = ortho.cuda_enabled()
+CUDA = orthon_cuda_available()
 
 
 # Tiny model fixture.
@@ -251,9 +252,9 @@ class TestGradScalerUnscale:
         opt.zero_grad()
         s.scale(ortho.sum(model(x))).backward()
         s.unscale_(opt)
-        for _, _, _, master in opt._entries:
-            if master.grad is not None:
-                assert master.grad is not None  # at least one should exist
+        assert any(p.grad is not None for p in model.parameters())
+        for p, master in zip(model.parameters(), opt.state_dict()["masters"]):
+            assert (master.grad is None) == (p.grad is None)
 
     def test_unscale_divides_grad_by_scale(self):
         """Master grad after unscale_ should match direct (unscaled) backward."""
@@ -268,7 +269,7 @@ class TestGradScalerUnscale:
         opt.zero_grad()
         ortho.sum(model(x)).backward()
         ref = {}
-        for idx, (sub_mod, name, orig_dtype, master) in enumerate(opt._entries):
+        for idx, master in enumerate(opt.state_dict()["masters"]):
             if master.grad is not None:
                 ref[idx] = _flatten(ortho.cast(master.grad, "float32").tolist())
 
@@ -278,13 +279,13 @@ class TestGradScalerUnscale:
         scaler2 = GradScaler(init_scale=SCALE)
         scaler2.unscale_(opt)
 
-        for idx, (sub_mod, name, orig_dtype, master) in enumerate(opt._entries):
+        for idx, master in enumerate(opt.state_dict()["masters"]):
             if master.grad is not None and idx in ref:
                 got = _flatten(ortho.cast(master.grad, "float32").tolist())
                 exp = ref[idx]
                 for g, e in zip(got, exp):
                     assert abs(g - e) < abs(e) * 0.01 + 1e-6, \
-                        f"entry {idx} ({name}): got {g:.6f}, expected {e:.6f}"
+                        f"parameter {idx}: got {g:.6f}, expected {e:.6f}"
 
     def test_unscale_idempotent(self):
         """Calling unscale_ twice should not double-divide."""
@@ -297,10 +298,10 @@ class TestGradScalerUnscale:
         s.unscale_(opt)
         # Capture grad values after first unscale
         grad1 = {name: _flatten(ortho.cast(master.grad, "float32").tolist())
-                 for _, name, _, master in opt._entries if master.grad is not None}
+                 for name, master in enumerate(opt.state_dict()["masters"]) if master.grad is not None}
         s.unscale_(opt)  # second call must be ignored
         grad2 = {name: _flatten(ortho.cast(master.grad, "float32").tolist())
-                 for _, name, _, master in opt._entries if master.grad is not None}
+                 for name, master in enumerate(opt.state_dict()["masters"]) if master.grad is not None}
         for name in grad1:
             for a, b in zip(grad1[name], grad2[name]):
                 assert abs(a - b) < 1e-9
@@ -448,7 +449,7 @@ class TestGradScalerCudaFp16:
         opt.zero_grad()
         scaler.scale(ortho.sum(model(x))).backward()
         scaler.unscale_(opt)
-        for _, _, orig_dtype, master in opt._entries:
+        for orig_dtype, master in zip(opt.state_dict()["orig_dtypes"], opt.state_dict()["masters"]):
             if orig_dtype == "float16" and master.grad is not None:
                 assert master.grad.dtype == "float32"
 
@@ -505,8 +506,9 @@ class TestGradScalerCudaFp16:
     def test_fp16_nonfinite_grad_skips_step_and_backs_off_scale(self):
         model, opt, scaler = self._setup("half", scale=8.0)
         scaler = GradScaler(init_scale=8.0, backoff_factor=0.25)
-        sub_mod, name, orig_dtype, master = opt._entries[0]
-        p = sub_mod._parameters[name]
+        master = opt.state_dict()["masters"][0]
+        p = next(model.parameters())
+        orig_dtype = p.dtype
         before = _param_values_f32(model)
         grad = ortho.cast(ortho.full(list(p.shape), float("inf")).to("cuda"), "float16")
         p.set_grad(grad)
@@ -526,8 +528,7 @@ class TestGradScalerCudaFp16:
 
         for expected_scale in (2.0, 8.0):
             opt.zero_grad()
-            sub_mod, name, _, _ = opt._entries[0]
-            p = sub_mod._parameters[name]
+            p = next(model.parameters())
             grad = ortho.cast(ortho.full(list(p.shape), 1.0).to("cuda"), "float16")
             p.set_grad(grad)
             scaler.step(opt)

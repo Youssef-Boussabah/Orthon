@@ -1,8 +1,9 @@
 """Measure Orthon local checkpoint save/load overhead on a synthetic MLP."""
 
+from benchmarks._support.training import mark_correctness, measured, configure, options, run as run_measurement
+
 import argparse
 import tempfile
-import time
 from pathlib import Path
 
 import orthon as ortho
@@ -83,7 +84,8 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=0.001)
     parser.add_argument("--checkpoint", default="")
     parser.add_argument("--keep-checkpoint", action="store_true")
-    args = parser.parse_args()
+    options(parser)
+    args = configure(parser.parse_args())
     if args.steps < 1:
         parser.error("--steps must be at least 1")
     if args.resume_steps < 1:
@@ -107,31 +109,34 @@ def main():
     else:
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 
-    save_start = time.perf_counter()
-    ortho.save_checkpoint(
-        checkpoint_path,
-        model=model,
-        optimizer=optimizer,
-        metadata={"steps": args.steps, "benchmark": "checkpoint_overhead"},
-    )
-    save_ms = (time.perf_counter() - save_start) * 1000.0
+    with measured("bench_checkpoint_overhead:save_start:main", lambda: None, calls=1, device="cpu", implementation="orthon", dtype="float32", config=vars(args)) as _region_save_start:
+        ortho.save_checkpoint(
+            checkpoint_path,
+            model=model,
+            optimizer=optimizer,
+            metadata={"steps": args.steps, "benchmark": "checkpoint_overhead"},
+        )
+    save_ms = (_region_save_start["seconds"]) * 1000.0
     checkpoint_size_kb = checkpoint_path.stat().st_size / 1024.0
 
     restored = make_model(args.input_dim, args.hidden, args.output_dim)
     restored_optimizer = Adam(restored.parameters(), lr=args.lr)
-    load_start = time.perf_counter()
-    metadata = ortho.load_checkpoint(
-        checkpoint_path,
-        model=restored,
-        optimizer=restored_optimizer,
-    )
-    load_ms = (time.perf_counter() - load_start) * 1000.0
+    with measured("bench_checkpoint_overhead:load_start:main", lambda: None, calls=1, device="cpu", implementation="orthon", dtype="float32", config=vars(args)) as _region_load_start:
+        metadata = ortho.load_checkpoint(
+            checkpoint_path,
+            model=restored,
+            optimizer=restored_optimizer,
+        )
+    load_ms = (_region_load_start["seconds"]) * 1000.0
 
     continuous_losses = train_steps(model, optimizer, x, args.resume_steps)
     resumed_losses = train_steps(restored, restored_optimizer, x, args.resume_steps)
     max_loss_delta = abs(continuous_losses[-1] - resumed_losses[-1])
     max_parameter_delta = max_param_diff(model, restored)
     resume_match = max_loss_delta <= 1e-6 and max_parameter_delta <= 1e-5
+    mark_correctness("pass" if resume_match else "fail", max_loss_delta=max_loss_delta,max_parameter_delta=max_parameter_delta)
+    if not resume_match:
+        raise RuntimeError("checkpoint resume correctness failed")
     params = parameter_count(model)
 
     print("benchmark_name: checkpoint_overhead")
@@ -166,4 +171,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run_measurement(main, "bench_checkpoint_overhead")

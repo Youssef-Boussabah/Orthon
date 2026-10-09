@@ -1,19 +1,8 @@
-"""CUDA device-context correctness.
+"""CUDA calls select and restore the Tensor's exact device.
 
-Every CUDA operation in the ordinary tensor runtime establishes an RAII
-``DeviceGuard`` from its own authoritative tensor. Without one, CUDA work can
-execute against a tensor on ``cuda:N`` while the runtime's current device is
-some other index: ``memory_pool_allocate`` selects a device only when it falls
-through to a raw ``cudaMalloc``, so a cache hit returns earlier and leaves the
-ambient device untouched.
-
-HONESTY NOTE, since it governs how much these tests prove: this machine has one
-GPU. With a single device, "the current device is still 0 afterwards" is true
-whether or not any guard exists, so the runtime assertions below are regression
-TRIPWIRES for multi-GPU CI rather than proof. The load-bearing evidence here is
-the source-level coverage asserted at the bottom of this file. Every genuinely
-multi-device case skips explicitly rather than pretending to run.
-"""
+Multi-device cases require two GPUs; source fences protect unconditional
+DeviceGuard usage even when hardware gates skip those cases."""
+from tests.support.capabilities import orthon_cuda_available
 import os
 import re
 
@@ -24,7 +13,7 @@ import orthon as ortho
 
 torch = pytest.importorskip("torch")
 
-CUDA = ortho.cuda_enabled()
+CUDA = orthon_cuda_available()
 requires_cuda = pytest.mark.skipif(not CUDA, reason="CUDA not available")
 requires_torch_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -60,6 +49,7 @@ def _current():
 
 
 def _read(rel):
+    rel = rel.replace("src/ops/cuda/", "src/backends/cuda/").replace("src/ops/cpu/", "src/ops/")
     with open(os.path.join(REPO, rel), encoding="utf-8") as f:
         return f.read()
 
@@ -69,10 +59,7 @@ def _strip_comments(src):
     return re.sub(r"//[^\n]*", "", src)
 
 
-# --------------------------------------------------------------------------
 # exact output/gradient device is preserved
-# --------------------------------------------------------------------------
-
 OPS = {
     "unary_relu": lambda x: ortho.relu(x),
     "unary_tanh": lambda x: ortho.tanh(x),
@@ -152,10 +139,7 @@ def test_tensor_to_roundtrip_preserves_exact_devices():
     assert tracked._has_grad_fn
 
 
-# --------------------------------------------------------------------------
-# current-device tripwires (weak on one GPU -- see module docstring)
-# --------------------------------------------------------------------------
-
+# Current-device restoration; multi-device cases distinguish ordinals.
 @requires_cuda
 @requires_torch_cuda
 @pytest.mark.parametrize("name", sorted(OPS))
@@ -251,10 +235,7 @@ def test_backward_on_a_second_gpu_restores_the_first():
     assert _current() == 0
 
 
-# --------------------------------------------------------------------------
-# Source-level coverage: the load-bearing evidence on single-GPU hardware
-# --------------------------------------------------------------------------
-
+# DeviceGuard ownership across asynchronous CUDA call sites
 # Sites that legitimately keep an explicit cudaSetDevice, with the reason.
 ALLOWED_RAW_SETTERS = {
     # The guard itself: this is where the primitive is supposed to live.
@@ -324,6 +305,14 @@ def test_entry_point_guards_its_authoritative_device(rel, fn, dev):
     """Spot-check that representative entry points guard on the operand the
     audit table names as authoritative, not on something incidental."""
     src = _read(rel)
+    if fn == "cuda_matmul_tiled":
+        # The diagnostic frontend delegates to
+        # the plan executor. Device selection belongs to the actual launchers.
+        from tests.support.source import function
+        for executor in ("execute_custom_2d", "execute_custom_batched",
+                         "cublas_gemm_2d", "cublas_gemm_batched"):
+            assert "DeviceGuard guard(%s)" % dev in function(src, executor)
+        return
     # The lookbehind matters: validate_cuda_fused_linear_relu CONTAINS
     # cuda_fused_linear_relu, so its own definition would otherwise match first.
     for m in re.finditer(r"(?<!\w)" + re.escape(fn) + r"\s*\([^;{]*\)\s*\{",
@@ -336,30 +325,29 @@ def test_entry_point_guards_its_authoritative_device(rel, fn, dev):
 
 
 def test_memory_pool_raw_paths_use_the_guard():
-    body = _strip_comments(_read("src/core/memory_pool.cpp"))
-    alloc = body[body.index("void* raw_allocate"):]
-    alloc = alloc[:alloc.index("void raw_free")]
-    free = body[body.index("void raw_free"):]
-    free = free[:free.index("void update_peak_locked")]
+    # The pool delegates raw CUDA ownership to the explicit CUDA allocator.
+    body = _strip_comments(_read("src/memory/cuda_allocator.cpp"))
+    alloc = body[body.index("cuda_raw_allocate("):body.index("cuda_raw_free(")]
+    free = body[body.index("cuda_raw_free("):]
     assert "DeviceGuard guard(device)" in alloc
     assert "DeviceGuard guard(device)" in free
     assert "cudaSetDevice" not in alloc and "cudaSetDevice" not in free
 
 
 def test_tensor_to_guards_every_cuda_branch():
-    # Tensor::to is split into to_physical (the transfer) plus a thin
-    # autograd wrapper. The guard obligations live with the transfer code.
-    body = _strip_comments(_read("src/core/tensor.cpp"))
-    to_body = body[body.index("static Tensor to_physical(const Tensor& self, Device target)"):]
-    to_body = to_body[:to_body.index("Tensor Tensor::to(Device target)")]
+    # Tensor::to uses registered pure transfer adapters.
+    # DeviceGuard obligations stay in the selected execution adapter.
+    body = _strip_comments(_read("src/backends/cuda/adapters.cpp"))
+    to_body = body[body.index("Tensor host_to_cuda(const Tensor& self, Device target)"):]
+    to_body = to_body[:to_body.index("Tensor cuda_add_adapter")]
     # One guard for the same-device copy, and one for each cross-device branch.
     assert to_body.count("DeviceGuard guard") >= 4
     # The cuda:N -> cuda:M branch uses cudaMemcpyPeer, which names both
     # device ordinals explicitly, rather than an ambient-context
     # cudaMemcpy(..., cudaMemcpyDeviceToDevice). The guard obligation is
     # asserted for whichever transfer call each branch uses.
-    for kind in ("cudaMemcpyHostToDevice", "cudaMemcpyDeviceToHost",
-                 "cudaMemcpyPeer"):
+    for kind in ("copy_h2d_snapshot", "copy_d2h_blocking",
+                 "peer_copy_blocking"):
         i = to_body.index(kind)
         assert "DeviceGuard guard" in to_body[max(0, i - 400):i], (
             "%s is not preceded by a DeviceGuard" % kind)

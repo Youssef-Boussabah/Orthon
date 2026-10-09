@@ -210,7 +210,7 @@ def _nccl_worker(rank, world_size, store, case_name, results, failures):
             loss.backward()
             results.put((rank, {
                 "averaged_grad": _grad_values(model),
-                "bucket_count": len(ddp_model._buckets),
+                "bucket_count": ddp_model._reducer.diagnostics()["buckets"],
             }))
         elif case_name == "ddp_bucket_overlap_grad_average":
             model = Linear(2, 1)
@@ -226,23 +226,23 @@ def _nccl_worker(rank, world_size, store, case_name, results, failures):
             x = _tensor_on_rank(rank, rank + 1, shape=(1, 2))
             loss = ortho.sum(ddp_model(x))
             loss.backward()
-            pending_after_backward = len(ddp_model._outstanding_bucket_work)
-            launch_count = ddp_model._overlap_bucket_launch_count
+            pending_after_backward = ddp_model._reducer.diagnostics()["outstanding"]
+            launch_count = ddp_model._reducer.diagnostics()["async_launches"]
             ddp_model.wait_for_gradient_sync()
             first_wait_grad = _grad_values(model)
             ddp_model.wait_for_gradient_sync()
             results.put((rank, {
                 "averaged_grad": _grad_values(model),
                 "first_wait_grad": first_wait_grad,
-                "bucket_count": len(ddp_model._buckets),
+                "bucket_count": ddp_model._reducer.diagnostics()["buckets"],
                 "launch_count": launch_count,
                 "pending_after_backward": pending_after_backward,
-                "pending_after_wait": len(ddp_model._outstanding_bucket_work),
+                "pending_after_wait": ddp_model._reducer.diagnostics()["outstanding"],
             }))
         elif case_name == "ddp_overlap_multi_step":
             # Multi-STEP overlap training with the documented
             # optimizer.zero_grad() sequence. One backward is not enough to
-            # regress the 2x A100 finding: stale per-backward overlap state
+            # catch stale per-backward overlap state
             # made every backward after the first launch zero collectives, so
             # the ranks silently trained on their different local gradients.
             model = Linear(2, 1)
@@ -262,7 +262,7 @@ def _nccl_worker(rank, world_size, store, case_name, results, failures):
             for _ in range(3):
                 loss = ortho.sum(ddp_model(x))
                 loss.backward()
-                launch_counts.append(ddp_model._overlap_bucket_launch_count)
+                launch_counts.append(ddp_model._reducer.diagnostics()["async_launches"])
                 optimizer.step()
                 optimizer.zero_grad()
                 params_per_step.append([
@@ -270,7 +270,7 @@ def _nccl_worker(rank, world_size, store, case_name, results, failures):
                     for parameter in model.parameters()
                 ])
             results.put((rank, {
-                "bucket_count": len(ddp_model._buckets),
+                "bucket_count": ddp_model._reducer.diagnostics()["buckets"],
                 "launch_counts": launch_counts,
                 "params_per_step": params_per_step,
             }))

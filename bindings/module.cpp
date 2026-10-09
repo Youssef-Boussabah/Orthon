@@ -2,14 +2,11 @@
 #include <orthon/autograd/grad_mode.h>
 #include <orthon/core/memory_pool.h>
 #include <orthon/device/device.h>
+#include <orthon/runtime/runtime.h>
 
 #include <cstdint>
 #include <stdexcept>
 #include <string>
-
-#ifdef WITH_CUDA
-#include <cuda_runtime.h>
-#endif
 
 namespace py = pybind11;
 
@@ -45,7 +42,7 @@ PYBIND11_MODULE(_C, m) {
 #endif
     });
 
-    // No-op in CPU builds; blocks until all GPU work completes in CUDA builds.
+    // No-op in CPU builds; blocks for current-device work in CUDA builds.
     // Used by benchmarks to get accurate CUDA kernel timing.
     //
     // This is deliberately a CURRENT-DEVICE API, not a tensor-scoped one, and
@@ -53,9 +50,7 @@ PYBIND11_MODULE(_C, m) {
     // device comes from its operands and is established with a DeviceGuard -
     // "synchronize" is defined in terms of the CUDA context the caller is in.
     m.def("cuda_synchronize", []() {
-#ifdef WITH_CUDA
-        cudaDeviceSynchronize();
-#endif
+        orthon::default_runtime().synchronize_current_cuda();
     });
 
     m.def("_memory_pool_set_enabled", &orthon::memory_pool_set_enabled);
@@ -90,6 +85,7 @@ PYBIND11_MODULE(_C, m) {
         d["current_bytes"] = s.current_bytes;
         d["peak_bytes"] = s.peak_bytes;
         d["cached_bytes"] = s.cached_bytes;
+        d["reserved_bytes"] = s.reserved_bytes;
         return d;
     });
 

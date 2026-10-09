@@ -1,3 +1,5 @@
+import orthon._diagnostics as diag
+from tests.support.capabilities import orthon_cuda_available as _cuda_available
 import pytest
 
 import orthon as ortho
@@ -6,12 +8,6 @@ import orthon.functional as F
 torch = pytest.importorskip("torch")
 
 
-def _cuda_available():
-    try:
-        ortho.zeros([1]).to("cuda")
-        return True
-    except RuntimeError:
-        return False
 
 
 requires_cuda = pytest.mark.skipif(not _cuda_available(), reason="CUDA not available")
@@ -158,28 +154,40 @@ def test_cuda_non_contiguous_dim_reduction_matches_torch():
 @requires_cuda
 def test_cuda_full_reductions_use_scratch_workspace_and_reuse_reserved_block():
     x = ortho.ones([4096]).to("cuda")
-    ortho._memory_pool_reset_scratch("cuda")
 
     summed = ortho.sum(x)
     ortho.cuda_synchronize()
     assert summed.to("cpu").item() == pytest.approx(4096.0)
-    sum_stats = ortho._memory_pool_scratch_stats("cuda")
-    assert sum_stats["used_bytes"] > 0
+    sum_stats = diag.memory_pool_scratch_stats("cuda")
+    # Scoped operation lease has returned its region after enqueue.
+    assert sum_stats["used_bytes"] == 0
+    assert sum_stats["peak_used_bytes"] > 0
     assert sum_stats["reserved_bytes"] >= sum_stats["used_bytes"]
 
     meaned = ortho.mean(x)
     ortho.cuda_synchronize()
     assert meaned.to("cpu").item() == pytest.approx(1.0)
-    mean_stats = ortho._memory_pool_scratch_stats("cuda")
+    mean_stats = diag.memory_pool_scratch_stats("cuda")
     assert mean_stats["reserved_bytes"] == sum_stats["reserved_bytes"]
     assert mean_stats["used_bytes"] == sum_stats["used_bytes"]
 
     maxed = ortho.max(x)
     ortho.cuda_synchronize()
     assert maxed.to("cpu").item() == pytest.approx(1.0)
-    max_stats = ortho._memory_pool_scratch_stats("cuda")
+    max_stats = diag.memory_pool_scratch_stats("cuda")
     assert max_stats["reserved_bytes"] == sum_stats["reserved_bytes"]
-    assert max_stats["used_bytes"] > sum_stats["used_bytes"]
+    assert max_stats["used_bytes"] == 0
+    assert max_stats["peak_used_bytes"] >= sum_stats["peak_used_bytes"]
+
+    argmaxed = ortho.argmax(x)
+    ortho.cuda_synchronize()
+    assert argmaxed.to("cpu").item() == 0
+    argmax_stats = diag.memory_pool_scratch_stats("cuda")
+    assert argmax_stats["reserved_bytes"] == max_stats["reserved_bytes"]
+    assert argmax_stats["used_bytes"] == 0
+    # 16 partial float values and 16 Int64 winners, each region aligned by
+    # the arena; no legacy reset is needed between these four operations.
+    assert argmax_stats["peak_used_bytes"] >= 16 * (4 + 8)
 
 
 def test_invalid_dim_raises():

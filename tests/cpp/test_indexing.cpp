@@ -1,11 +1,11 @@
 #include <gtest/gtest.h>
-#include <orthon/ops/cpu/fill_ops.h>
-#include <orthon/ops/cpu/binary_ops.h>
-#include <orthon/ops/cpu/shape_ops.h>
+#include <orthon/ops/fill_ops.h>
+#include <orthon/ops/binary_ops.h>
+#include <orthon/ops/shape_ops.h>
 #include <orthon/core/tensor_impl.h>
 #include <orthon/autograd/grad_mode.h>
-#include <orthon/ops/cpu/index_ops.h>
-#include <orthon/ops/cpu/slice_ops.h>
+#include <orthon/ops/index_ops.h>
+#include <orthon/ops/slice_ops.h>
 
 #ifdef WITH_CUDA
 #include <cuda_runtime_api.h>
@@ -16,8 +16,7 @@
 // global scope, so this file is not wrapped in the namespace.
 using namespace orthon;
 
-// ---- operator[] ----
-
+// operator[]
 TEST(Indexing, Index1D) {
     auto t = full({4}, 0.0f);
     auto* p = static_cast<float*>(t.data());
@@ -70,11 +69,10 @@ TEST(Indexing, IndexSharesStorage) {
     EXPECT_FLOAT_EQ(*static_cast<const float*>(t.data()), 99.f);
 }
 
-// ---- operator[] autograd ----
+// operator[] autograd
 //
-// The Python suite is the authoritative validation for these gates on the
-// current machine; these mirror the core contract for C++ callers and for
-// platforms where the GoogleTest targets actually build.
+// These cases cover the same autograd contract as the Python suite
+// through the native API.
 
 TEST(IndexingAutograd, AttachesGraphWhenParentRequiresGrad) {
     auto t = full({3, 4}, 1.0f);
@@ -158,7 +156,7 @@ TEST(IndexingAutograd, GradientCarriesNoGraph) {
     EXPECT_TRUE(g.is_contiguous());
 }
 
-// ---- index_backward internal contract ----
+// index_backward internal contract
 //
 // index_backward is deliberately not exposed to Python, so these guards are
 // only reachable from C++. Both fire before the CPU/CUDA branch is chosen, so
@@ -208,8 +206,7 @@ TEST(IndexBackwardContract, AcceptsTheExactBlockShape) {
     }
 }
 
-// ---- slice ----
-
+// slice
 TEST(Slice, Slice1D) {
     auto t = full({6}, 0.0f);
     auto* p = static_cast<float*>(t.data());
@@ -251,11 +248,10 @@ TEST(Slice, SliceInvalidRange) {
 }
 
 
-// ---- slice autograd ----
+// slice autograd
 //
-// The Python suite is the authoritative validation for these gates on the
-// current machine; these mirror the core contract for C++ callers and for
-// platforms where the GoogleTest targets actually build.
+// These cases cover the same autograd contract as the Python suite
+// through the native API.
 
 TEST(SliceAutograd, AttachesGraphWhenParentRequiresGrad) {
     auto t = full({3, 4}, 1.0f);
@@ -270,7 +266,7 @@ TEST(SliceAutograd, AttachesGraphWhenParentRequiresGrad) {
     EXPECT_EQ(s.shape(),   (std::vector<int64_t>{3, 2}));
     EXPECT_EQ(s.strides(), (std::vector<int64_t>{4, 1}));
     EXPECT_EQ(s.impl()->storage_offset(), 1);
-    EXPECT_EQ(s.impl()->storage().get(), t.impl()->storage().get());
+    EXPECT_EQ(s.impl()->buffer().get(), t.impl()->buffer().get());
 }
 
 TEST(SliceAutograd, AttachesNothingWhenParentDoesNotRequireGrad) {
@@ -293,7 +289,7 @@ TEST(SliceAutograd, NoGradModeAttachesNothingButKeepsTheView) {
     EXPECT_TRUE(s.is_leaf());
     EXPECT_EQ(s.shape(), (std::vector<int64_t>{3, 2}));
     EXPECT_EQ(s.impl()->storage_offset(), 1);
-    EXPECT_EQ(s.impl()->storage().get(), t.impl()->storage().get());
+    EXPECT_EQ(s.impl()->buffer().get(), t.impl()->buffer().get());
 }
 
 TEST(SliceAutograd, TrackedSliceStillSharesStorage) {
@@ -443,7 +439,7 @@ TEST(SliceAutograd, GradientCarriesNoGraph) {
     EXPECT_TRUE(g.is_contiguous());
 }
 
-// ---- slice_backward internal contract ----
+// slice_backward internal contract
 //
 // slice_backward is deliberately not exposed to Python, so these guards are
 // only reachable from C++. Every one of them fires before the CPU/CUDA branch
@@ -540,8 +536,7 @@ TEST(SliceBackwardContract, EmptyParentReturnsAnEmptyGradient) {
     EXPECT_EQ(out.shape(), (std::vector<int64_t>{2, 0, 3}));
     EXPECT_EQ(out.numel(), 0);
 }
-// ---- broadcasting ----
-
+// broadcasting
 TEST(Broadcasting, ScalarBroadcast) {
     auto a = full({1}, 3.0f);
     auto b = full({4}, 2.0f);
@@ -578,8 +573,7 @@ TEST(Broadcasting, SameShapeStillWorks) {
     EXPECT_FLOAT_EQ(*static_cast<const float*>(c.data()), 6.0f);
 }
 
-// ---- .to() ----
-
+// .to()
 TEST(ToDevice, CPUToCPUIsNoop) {
     auto t = full({3}, 1.0f);
     auto t2 = t.to(Device{});

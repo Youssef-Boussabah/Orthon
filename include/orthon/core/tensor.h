@@ -41,7 +41,7 @@ public:
     // Exposes implementation for ops that need to build views or access storage.
     const std::shared_ptr<TensorImpl>& impl() const;
 
-    // ---- autograd metadata ----
+    // autograd metadata
     bool     requires_grad() const;
     Tensor&  requires_grad_(bool value = true);
     bool     is_leaf() const;
@@ -51,14 +51,15 @@ public:
     void     set_grad(const Tensor& grad);
     void     zero_grad();
     void     add_post_accumulate_grad_hook(std::function<void()> hook);
+    void     register_backward_finalizer(uintptr_t key, std::function<void()> callback);
 
-    // ---- computation graph ----
+    // computation graph
     bool                  has_grad_fn() const;
     std::shared_ptr<Node> grad_fn() const;
     void                  set_grad_fn(std::shared_ptr<Node> fn);
     void                  clear_grad_fn();
 
-    // ---- backward pass ----
+    // backward pass
     void backward(bool retain_graph = false);
 
 private:

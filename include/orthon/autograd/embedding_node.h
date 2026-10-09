@@ -4,8 +4,8 @@
 #include <vector>
 
 #include <orthon/autograd/node.h>
-#include <orthon/ops/cpu/shape_ops.h>
-#include <orthon/ops/cpu/embedding_ops.h>
+#include <orthon/ops/shape_ops.h>
+#include <orthon/ops/embedding_ops.h>
 
 namespace orthon {
 

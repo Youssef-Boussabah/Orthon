@@ -1,16 +1,5 @@
-"""BatchNorm numerical and autograd parity against PyTorch.
-
-Every case uses fixed, deterministic, non-linear fixtures and a fixed
-non-uniform upstream gradient, so that:
-
-  * per-channel statistics genuinely differ between channels, which would
-    expose a channel-indexing mistake, and
-  * the input gradient is substantial rather than the near-zero value a plain
-    sum(output) produces, which would be a weak oracle.
-
-The loss is sum(output * upstream) with identical upstream values fed to both
-frameworks.
-"""
+"""BatchNorm values, gradients and running-statistic parity against PyTorch."""
+from tests.support.capabilities import orthon_cuda_available
 import numpy as np
 import pytest
 
@@ -19,7 +8,7 @@ from orthon.nn import BatchNorm1d, BatchNorm2d
 
 torch = pytest.importorskip("torch")
 
-CUDA = ortho.cuda_enabled()
+CUDA = orthon_cuda_available()
 requires_cuda = pytest.mark.skipif(not CUDA, reason="CUDA not available")
 requires_torch_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -138,8 +127,7 @@ def _run_parity(kind, shape, affine, device="cpu", dtype="float32",
     return bn, y, x
 
 
-# ---- CPU float32 parity ----
-
+# CPU float32 parity
 @pytest.mark.parametrize("shape", SHAPES_1D)
 def test_bn1d_cpu_train_parity_affine(shape):
     _run_parity("1d", shape, affine=True)
@@ -179,8 +167,7 @@ def test_cpu_running_stats_differ_per_channel():
     assert len(set(np.round(rv, 6))) == len(rv)
 
 
-# ---- CUDA float32 parity ----
-
+# CUDA float32 parity
 @requires_cuda
 @requires_torch_cuda
 @pytest.mark.parametrize("shape", SHAPES_1D)
@@ -226,8 +213,7 @@ def test_cuda_state_stays_on_device():
     assert bn.weight.grad.device.is_cuda()
 
 
-# ---- low-precision CUDA ----
-
+# low-precision CUDA
 @requires_cuda
 @requires_torch_cuda
 @pytest.mark.parametrize("kind,shape", [("1d", (4, 3)), ("2d", (2, 3, 2, 2))])
@@ -272,8 +258,7 @@ def test_cpu_float16_is_unsupported_by_reductions():
         bn(x)
 
 
-# ---- float64 CPU ----
-
+# float64 CPU
 def test_cpu_float64_forward_parity():
     """float64 forward matches PyTorch. Backward is blocked natively, see below."""
     shape = (4, 3)
@@ -352,8 +337,7 @@ def test_cpu_float64_backward_parity():
     assert np.abs(_npy(x.grad)).max() > 0.1, "weak oracle: gradient is ~zero"
 
 
-# ---- degenerate training shapes ----
-
+# degenerate training shapes
 @pytest.mark.parametrize("kind,shape", [("1d", (1, 3)), ("2d", (1, 3, 1, 1))])
 def test_training_rejects_one_value_per_channel(kind, shape):
     Mod = BatchNorm1d if kind == "1d" else BatchNorm2d
@@ -388,8 +372,7 @@ def test_degenerate_message_matches_pytorch_wording():
     assert "Expected more than 1 value per channel when training" in str(exc.value)
 
 
-# ---- implementation properties ----
-
+# implementation properties
 def test_batchnorm_module_does_not_import_numpy():
     """BatchNorm's numerical path is Tensor-native; NumPy is no longer needed."""
     import orthon.nn.batchnorm as bnmod

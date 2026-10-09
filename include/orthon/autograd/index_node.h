@@ -1,6 +1,6 @@
 #pragma once
 #include <orthon/autograd/node.h>
-#include <orthon/ops/cpu/index_ops.h>
+#include <orthon/ops/index_ops.h>
 #include <cstdint>
 #include <vector>
 

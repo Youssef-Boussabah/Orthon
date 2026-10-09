@@ -1,6 +1,6 @@
 // Namespace and include-tree contract for the native API.
 //
-// Deliberately does NOT say `using namespace orthon;`. Everything below is
+// Deliberately does not say `using namespace orthon;`. Everything below is
 // written the way an external consumer must write it, so the file doubles as a
 // header-consumer smoke test: it compiles only if `<orthon/...>` is the include
 // spelling and `orthon::` is the qualification.
@@ -10,38 +10,30 @@
 #include <orthon/autograd/node.h>
 #include <orthon/core/dtype.h>
 #include <orthon/core/memory_pool.h>
-#include <orthon/core/storage.h>
+#include <orthon/runtime/runtime.h>
 #include <orthon/core/tensor.h>
 #include <orthon/core/tensor_impl.h>
 #include <orthon/device/device.h>
 #include <orthon/device/device_guard.h>
 #include <orthon/memory/allocator.h>
 #include <orthon/memory/cpu_allocator.h>
-#include <orthon/ops/cpu/binary_ops.h>
-#include <orthon/ops/cpu/fill_ops.h>
-#include <orthon/ops/cpu/matmul_ops.h>
-#include <orthon/ops/cpu/reduce_ops.h>
-#include <orthon/ops/cpu/shape_ops.h>
-#include <orthon/ops/cpu/unary_ops.h>
+#include <orthon/memory/cuda_allocator.h>
+#include <orthon/ops/binary_ops.h>
+#include <orthon/ops/fill_ops.h>
+#include <orthon/ops/matmul_ops.h>
+#include <orthon/ops/reduce_ops.h>
+#include <orthon/ops/shape_ops.h>
+#include <orthon/ops/unary_ops.h>
 
 #include <cstdint>
 #include <stdexcept>
 #include <type_traits>
 #include <vector>
 
-// ---------------------------------------------------------------------------
-// Compile-time guard: the global namespace is free of the framework's names.
-//
-// These are ordinary global definitions. If any header above still declared a
-// type called `Tensor`, or a function called `zeros`, at global scope, the
-// corresponding definition here would be a redeclaration - as a different type,
-// or as a different KIND of symbol - and this translation unit would fail to
-// compile. Nothing here is decorative: deleting the namespace from a public
-// header breaks the build at this file.
-// ---------------------------------------------------------------------------
+// Global sentinel definitions make leaked public names fail compilation
+// through conflicting declarations, protecting namespace isolation.
 struct Tensor      { std::int64_t sentinel; };
 struct TensorImpl  { std::int64_t sentinel; };
-struct Storage     { std::int64_t sentinel; };
 struct Node        { std::int64_t sentinel; };
 struct Device      { std::int64_t sentinel; };
 struct DeviceType  { std::int64_t sentinel; };
@@ -79,7 +71,6 @@ TEST(Identity, FrameworkTypesAreNotInTheGlobalNamespace) {
     // The global names above are this file's own placeholders, not the
     // framework's - proving the two are distinct types, not aliases.
     EXPECT_FALSE((std::is_same<::Tensor, orthon::Tensor>::value));
-    EXPECT_FALSE((std::is_same<::Storage, orthon::Storage>::value));
     EXPECT_FALSE((std::is_same<::Device, orthon::Device>::value));
     EXPECT_FALSE((std::is_same<::Node, orthon::Node>::value));
     EXPECT_FALSE((std::is_same<::DType, orthon::DType>::value));
@@ -127,22 +118,30 @@ TEST(Identity, MemoryPoolAndGradModeResolveUnderOrthon) {
     orthon::set_grad_enabled(grad_was_enabled);
 
     orthon::Device cpu(orthon::DeviceType::CPU, 0);
-    void* ptr = orthon::memory_pool_allocate(128, cpu);
-    ASSERT_NE(ptr, nullptr);
-    orthon::memory_pool_deallocate(ptr, cpu);
+    auto allocation = orthon::default_runtime().allocator(cpu)->allocate(128);
+    ASSERT_NE(allocation.data(), nullptr);
 }
 
 TEST(Identity, AllocatorServesHostMemoryOnly) {
     orthon::Device cpu(orthon::DeviceType::CPU, 0);
-    orthon::Allocator* host = orthon::get_allocator(cpu);
+    orthon::Allocator* host = orthon::default_runtime().allocator(cpu).get();
     ASSERT_NE(host, nullptr);
     EXPECT_TRUE(host->device().is_cpu());
 
-    // There is no CUDA allocator: device storage is served by the memory pool
-    // on the tensor's exact device, so a CUDA request here is a programming
-    // error rather than a fallback.
+    // Both CPU and CUDA allocators satisfy the same interface.
+    EXPECT_NE(dynamic_cast<orthon::CPUAllocator*>(host), nullptr);
+    auto allocation = host->allocate(128);
+    EXPECT_EQ(allocation.device(), cpu);
+    EXPECT_NE(allocation.data(), nullptr);
     orthon::Device gpu(orthon::DeviceType::CUDA, 0);
-    EXPECT_THROW(orthon::get_allocator(gpu), std::runtime_error);
+#ifdef WITH_CUDA
+    auto* cuda = orthon::default_runtime().allocator(gpu).get();
+    ASSERT_NE(dynamic_cast<orthon::CUDAAllocator*>(cuda), nullptr);
+    EXPECT_EQ(cuda->device(), gpu);
+#else
+    // Lookup now initializes a real CudaContext, so CPU builds reject there.
+    EXPECT_THROW(orthon::default_runtime().allocator(gpu).get(), std::runtime_error);
+#endif
 }
 
 TEST(Identity, DeviceGuardResolvesUnderOrthon) {

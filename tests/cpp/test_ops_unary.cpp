@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
-#include <orthon/ops/cpu/unary_ops.h>
-#include <orthon/ops/cpu/fill_ops.h>
-#include <orthon/ops/cpu/shape_ops.h>
+#include <orthon/ops/unary_ops.h>
+#include <orthon/ops/fill_ops.h>
+#include <orthon/ops/shape_ops.h>
 
 // The framework's public API lives in namespace orthon. Tests import it wholesale
 // so the TEST() bodies read as ordinary API usage; TEST() itself must stay at

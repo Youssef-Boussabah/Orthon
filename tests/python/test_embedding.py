@@ -1,3 +1,4 @@
+from tests.support.capabilities import orthon_cuda_available as _cuda_available
 import numpy as np
 import pytest
 
@@ -8,17 +9,9 @@ import orthon.nn as nn
 torch = pytest.importorskip("torch")
 
 
-def _cuda_available():
-    if not torch.cuda.is_available():
-        return False
-    try:
-        ortho.zeros([1]).to("cuda")
-        return True
-    except RuntimeError:
-        return False
 
 
-requires_cuda = pytest.mark.skipif(not _cuda_available(), reason="CUDA not available")
+requires_cuda = pytest.mark.skipif(not (torch.cuda.is_available() and _cuda_available()), reason="CUDA not available")
 
 
 def _indices(values, device="cpu", dtype=np.int64):
@@ -197,3 +190,37 @@ def test_embedding_simple_cuda_model_backward():
     loss.backward()
     assert embed.weight.grad.device.is_cuda()
     assert linear.weight.grad.device.is_cuda()
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=requires_cuda)])
+@pytest.mark.parametrize("dtype", [np.int32, np.int64])
+def test_r1_embedding_endpoints_duplicates_and_negative_padding(device, dtype):
+    weight = ortho.from_numpy(np.arange(8, dtype=np.float32).reshape(4, 2)).to(device)
+    weight.requires_grad_(True)
+    ids = _indices([0, 3, 0, 2], device, dtype)
+    output = ortho.embedding(ids, weight, padding_idx=-1)
+    assert output.to("cpu").tolist() == [0, 1, 6, 7, 0, 1, 4, 5]
+    output.sum().backward()
+    assert weight.grad.to("cpu").tolist() == [2, 2, 0, 0, 1, 1, 0, 0]
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=requires_cuda)])
+@pytest.mark.parametrize("dtype,value", [(np.int32, -1), (np.int32, 4), (np.int32, 2**31-1),
+                                        (np.int64, -1), (np.int64, 4), (np.int64, 2**32),
+                                        (np.int64, 2**63-1)])
+def test_r1_embedding_rejects_index_domain_before_gather(device, dtype, value):
+    weight = ortho.ones([4, 2]).to(device).requires_grad_(True)
+    version = weight._storage_version
+    with pytest.raises(IndexError, match="out of range"):
+        ortho.embedding(_indices([0, value], device, dtype), weight)
+    assert weight._storage_version == version and weight.grad is None
+    assert weight.to("cpu").tolist() == [1]*8
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=requires_cuda)])
+def test_r1_embedding_empty_indices_have_zero_gradient(device):
+    weight = ortho.ones([3, 2]).to(device).requires_grad_(True)
+    result = ortho.embedding(_indices([], device), weight)
+    assert result.shape == (0, 2)
+    result.backward()
+    assert weight.grad.to("cpu").tolist() == [0]*6

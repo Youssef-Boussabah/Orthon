@@ -1,48 +1,15 @@
-"""Differentiable Tensor.to / floating cast, and explicit internal detach.
+"""Differentiable transfers/floating casts and explicit graph-free internal copies.
 
-Both public operations participate in autograd. Detaching silently instead::
-
-    x.requires_grad_(True)
-    y = x.to("cuda")           # requires_grad=False, no grad_fn, leaf
-    z = orthon.cast(x, "float64")   # likewise
-
-would mean a loss built downstream could never reach ``x``. So:
-
-* ``to`` attaches a ``ToNode`` (identity derivative in logical coordinates;
-  backward returns the gradient to the exact source Device),
-* a REAL floating->floating ``cast`` attaches a ``CastNode`` (backward casts
-  the gradient back to the exact source dtype on the same device),
-
-while everything that needs a DETACHED result asks for it explicitly, with
-a ``no_grad`` region rather than a side effect: BatchNorm running-stat
-snapshots,
-``Module.to``/``Module.cast``/``half``/``bfloat16``, ``load_state_dict``
-preparation, AMP master-weight creation and restore, checkpoint/distributed
-host materialisation, and the internal materialisations inside
-``contiguous()`` and the CUDA matmul path.
-
-Deliberately unchanged, and pinned here so a uniformity "cleanup" fails:
-
-* conversions touching an integer/bool dtype never join a graph - there is
-  intentionally no straight-through estimator;
-* ``contiguous(x)``'s public graph contract stays exactly one
-  ``ContiguousNode`` - no hidden ToNode underneath.
-
-* same-dtype ``cast`` does not differ per device. ``cast(x, x.dtype)`` is
-  ``contiguous(x)`` on both - identity object for a contiguous source,
-  ``ContiguousNode`` for a strided one, never a ``CastNode``.
-
-ToNode and CastNode are value-INSENSITIVE: their derivatives never read the
-input's stored values, so no ``watch_version`` - mutating the source after
-forward stays legal unless a downstream value-sensitive node saved it.
-"""
+Same-dtype cast follows contiguous(); integer/bool casts are non-differentiable.
+Transfer and cast derivatives do not watch source values."""
+from tests.support.capabilities import orthon_cuda_available
 import numpy as np
 import pytest
 
 import orthon as ortho
 import orthon.nn as nn
 
-CUDA = ortho.cuda_enabled()
+CUDA = orthon_cuda_available()
 DEVICES = ["cpu"] + (["cuda"] if CUDA else [])
 requires_cuda = pytest.mark.skipif(not CUDA, reason="CUDA not available")
 
@@ -84,10 +51,7 @@ def _plain(y):
     return (not y.requires_grad) and (not y._has_grad_fn) and y.is_leaf
 
 
-# ---------------------------------------------------------------------------
 # forward to() contract
-# ---------------------------------------------------------------------------
-
 class TestToForward:
     @pytest.mark.parametrize("device", DEVICES)
     def test_same_device_to_is_tracked_physical_copy(self, device):
@@ -141,10 +105,7 @@ class TestToForward:
         assert _cpu_flat(y) == [1.0, 3.0, 2.0, 4.0]   # logical (transposed) order
 
 
-# ---------------------------------------------------------------------------
 # to() backward parity (nonuniform upstream)
-# ---------------------------------------------------------------------------
-
 class TestToBackward:
     @pytest.mark.parametrize("np_dtype", [np.float32, np.float64])
     def test_cpu_same_device_identity_gradient(self, np_dtype):
@@ -195,10 +156,7 @@ class TestToBackward:
         assert _cpu_flat(x.grad) == [3.0, -5.0]   # exactly representable
 
 
-# ---------------------------------------------------------------------------
 # cast contracts
-# ---------------------------------------------------------------------------
-
 class TestCastForward:
     def test_cpu_floating_cast_is_tracked(self):
         x = _t([1.0, 2.0], grad=True)
@@ -230,15 +188,9 @@ class TestCastForward:
 
     @pytest.mark.parametrize("device", DEVICES)
     def test_same_dtype_cast_is_contiguous_not_castnode(self, device):
-        """One contract on both devices.
+        """Same-dtype cast follows contiguous() on both devices, without a CastNode.
 
-        ``cast(x, x.dtype)`` is ``contiguous(x)`` - identity object for a
-        contiguous source, ContiguousNode for a strided one - never a copy and
-        never a CastNode. Letting CUDA fall into cuda_cast's memcpy branch
-        instead would return a fresh DETACHED copy, so the same call would mean
-        two different things per device. ``x.to(x.device)`` is the public way
-        to ask for an independent physical copy.
-        """
+        Use to() for an independent physical copy."""
         # Contiguous source: the very same tensor object, graph metadata intact.
         x = _t([1.0, 2.0], device, grad=True)
         y = ortho.cast(x, "float32")
@@ -285,10 +237,7 @@ class TestCastBackward:
         assert _cpu_flat(x.grad) == [3.0, 0.25]
 
 
-# ---------------------------------------------------------------------------
 # composition
-# ---------------------------------------------------------------------------
-
 class TestComposition:
     @requires_cuda
     def test_cpu_to_cuda_then_cast_f16_roundtrip_gradient(self):
@@ -376,10 +325,7 @@ class TestComposition:
         assert _cpu_flat(x.grad) == pytest.approx([3.5, 1.0])
 
 
-# ---------------------------------------------------------------------------
 # no_grad detaches both operations
-# ---------------------------------------------------------------------------
-
 class TestNoGradContract:
     @pytest.mark.parametrize("device", DEVICES)
     def test_no_grad_detaches_and_restores(self, device):
@@ -394,10 +340,7 @@ class TestNoGradContract:
         assert _tracked(x.to(x.device))
 
 
-# ---------------------------------------------------------------------------
 # contiguous keeps exactly one ContiguousNode
-# ---------------------------------------------------------------------------
-
 class TestContiguousGraphContract:
     @pytest.mark.parametrize("device", DEVICES)
     def test_contiguous_attaches_single_contiguous_node(self, device):
@@ -412,10 +355,7 @@ class TestContiguousGraphContract:
         assert _cpu_flat(x.grad) == [1.0, 1.0, 1.0, 1.0]
 
 
-# ---------------------------------------------------------------------------
 # Version-counter selectivity for ToNode / CastNode
-# ---------------------------------------------------------------------------
-
 class TestVersionSelectivity:
     @pytest.mark.parametrize("device", DEVICES)
     def test_to_survives_source_mutation(self, device):
@@ -452,10 +392,7 @@ class TestVersionSelectivity:
             t.backward()
 
 
-# ---------------------------------------------------------------------------
 # explicit internal detach contracts
-# ---------------------------------------------------------------------------
-
 class TestInternalDetachContracts:
     def test_batchnorm_running_stats_stay_graph_free(self):
         bn = nn.BatchNorm1d(3)
@@ -537,7 +474,7 @@ class TestInternalDetachContracts:
         model = nn.Linear(2, 2)
         model.to("cuda").half()
         opt = MixedPrecisionOptimizer(model, SGD, lr=0.01)
-        for _, _, orig_dtype, master in opt._entries:
+        for orig_dtype, master in zip(opt.state_dict()["orig_dtypes"], opt.state_dict()["masters"]):
             assert master.dtype == "float32"
             assert master.requires_grad
             assert master.is_leaf
@@ -555,7 +492,7 @@ class TestInternalDetachContracts:
         model2.to("cuda").half()
         opt2 = MixedPrecisionOptimizer(model2, SGD, lr=0.01)
         opt2.load_state_dict(state)
-        for _, _, orig_dtype, master in opt2._entries:
+        for orig_dtype, master in zip(opt2.state_dict()["orig_dtypes"], opt2.state_dict()["masters"]):
             assert master.dtype == "float32"
             assert master.requires_grad
             assert master.is_leaf

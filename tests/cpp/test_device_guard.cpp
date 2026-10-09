@@ -23,8 +23,7 @@ int visible_devices() {
 }  // namespace
 #endif
 
-// ---- CPU: a guard on a CPU Device is a no-op in every build ----
-
+// CPU: a guard on a CPU Device is a no-op in every build
 TEST(DeviceGuard, CpuDeviceIsANoOp) {
     EXPECT_NO_THROW({ DeviceGuard guard(Device{}); });
 }
@@ -75,8 +74,7 @@ TEST(DeviceGuard, ExceptionUnwindingRestoresSameDevice) {
     EXPECT_EQ(current_device(), 0);
 }
 
-// ---- Multi-GPU: these are the cases that actually prove restore-on-exit ----
-
+// Multi-GPU: these are the cases that actually prove restore-on-exit
 TEST(DeviceGuard, SelectsASecondDeviceAndRestoresTheFirst) {
     if (visible_devices() < 2) GTEST_SKIP() << "needs >=2 CUDA devices";
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);

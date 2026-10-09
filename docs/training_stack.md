@@ -1,256 +1,158 @@
-# Training Stack
+# Training stack
 
-The Python-facing model and training system: `nn.Module` and the layers,
-optimizers, mixed precision, and how they interact with checkpointing. This
-layer is deliberately pure Python over public tensor operations — it inherits
-device support, dtype behaviour and autograd from the native runtime
-([architecture.md](architecture.md)) instead of re-implementing any of them,
-which is why every layer works on CPU and CUDA without device-specific code.
+Orthon's Python modules, optimizers and explicit AMP wrapper retain native Tensor
+owners. The [API reference](api.md) lists the supported signatures; the
+[coverage matrix](cuda_coverage.md) bounds operator/dtype combinations.
 
-Related: [autograd.md](autograd.md) for what `backward()` does,
-[checkpoint_format.md](checkpoint_format.md) for the on-disk format,
-[training_workloads.md](training_workloads.md) for runnable end-to-end
-examples.
+## Module registration and stable parameters
 
-## Modules and parameters
+`python/orthon/nn/module.py` uses one private `Module._set_member` protocol for
+parameter, child module, buffer and ordinary attribute registration. A name has
+one category; reassignment removes stale registration in the other categories.
+`Parameter(data)` marks a Tensor trainable; assigning it registers its data Tensor.
+These private registration/preparation methods are not application extension APIs.
 
-`nn.Module` (`python/orthon/nn/module.py`) mirrors the PyTorch idiom: assign a
-`Parameter` or a child `Module` as an attribute and it is registered
-automatically; write `forward()`; call the module.
+`parameters()` deduplicates by Python Tensor owner and includes frozen registered
+parameters. `named_parameters()` preserves registered paths, including ties.
+Two paths pointing to the same Python owner are tied parameters. Two distinct
+owners sharing one Buffer remain distinct model/optimizer bindings.
 
-```python
-import orthon as ortho
-from orthon.nn import Linear, Module
+Supported `to`, `cast`, `half` and `bfloat16` prepare transformed representations
+for the whole module tree before publication. Parameter Python objects survive,
+so optimizers constructed earlier still see their current device/dtype. Rebinding
+native representation publishes leaf state and clears gradients
+when the representation actually changes. Native autograd metadata belongs to
+that representation; transform the model before attaching DDP hooks. A same-representation cast can preserve
+existing grad state. `to()` snapshots even on the same device and therefore
+normally changes the representation. Buffer-only owners are replaced; buffer ties
+and parameter-buffer ties are preserved during the supported transform protocol.
+Dtype transforms touch floating buffers; integer/bool buffers retain their dtype.
 
+Replacing a registered parameter explicitly with a new Parameter is a different
+operation: an existing optimizer still owns its original bound Tensor. Construct
+an optimizer for the intended new owners.
 
-class MLP(Module):
-    def __init__(self):
-        super().__init__()
-        self.fc1 = Linear(64, 32)
-        self.fc2 = Linear(32, 10)
+## Persistent buffers and state
 
-    def forward(self, x):
-        return self.fc2(ortho.relu(self.fc1(x)))
-```
+`register_buffer(name, tensor, persistent=True)` accepts Tensor or None. None
+remains a registered slot but is absent from tensor enumeration/state. Nonpersistent
+buffers transform with the model but are omitted from state_dict. BatchNorm's
+running mean/variance are persistent buffers. `train()`/`eval()` recursively
+change mode; changing mode does not by itself disable autograd.
 
-- **`Parameter`** wraps a tensor and sets `requires_grad=True`. Registration
-  happens in `Module.__setattr__`. `parameters()` walks the module tree
-  depth-first and deduplicates shared tensors by object identity — a tensor
-  registered under two names is yielded once. `named_parameters()` recurses
-  over the registered names without that deduplication, so a shared tensor
-  appears once per name it is registered under.
-- **Buffers** — non-trainable state such as BatchNorm's running statistics —
-  are registered with `register_buffer(name, tensor, persistent=True)`. They
-  move with `.to()`, cast with `.cast()` (floating buffers only, so a
-  model-wide `half()` cannot corrupt an integer index table), and persistent
-  ones appear in `state_dict()`. A buffer may be registered as `None` to
-  declare the slot before materializing it.
-- **`train()` / `eval()`** toggle the `training` flag recursively; `Dropout`
-  and BatchNorm read it.
+`state_dict()` exposes live Tensor references in registration order. File saving
+snapshots them. Direct Module loading and file restore share a private
+READ/VALIDATE/PREPARE/COMMIT protocol: all incoming values, shapes, keys and
+conversions are prepared before publishing. Conflicting values for tied parameter
+paths reject before commit. Default parameter load copies values without replacing
+owners/metadata; buffer slots receive independent prepared values. Explicit device
+remapping prepares parameter representations and nonpersistent buffer moves too.
+See [checkpoint interaction](#checkpoint-interaction).
 
-### `state_dict` and loading
+## Optimizer ownership
 
-`state_dict()` returns `{name: tensor}` for parameters and persistent
-buffers, with dotted hierarchical names (`"fc1.weight"`). The values are
-**live references**, not copies — which is what makes
-`model.load_state_dict(model.state_dict())` and in-place optimizer updates
-coherent. The file APIs snapshot instead; see
-[checkpoint_format.md](checkpoint_format.md#snapshot-vs-live-reference).
+`python/orthon/optim/_binding.py` captures strong Python parameter-owner bindings.
+Duplicate owner entries reject; distinct storage aliases remain separate bindings.
+A binding consults its owner's current representation at step time.
 
-`load_state_dict(state, strict=True)` validates everything first (key sets,
-shapes, types), prepares device- and dtype-reconciled copies, and only then
-commits. Parameters are copied **into**, never replaced, so optimizer
-references, `requires_grad`, `.grad` and post-accumulate hooks all survive a
-load.
+`SGD(params, lr, weight_decay=0.0, decay_bias=False)` stores configuration only.
+It updates parameters with gradients under no_grad and supports decoupled weight
+decay, skipping one-dimensional bias-like values unless requested. There is no
+momentum or parameter-group API.
 
-### Device movement and dtype casts
+`Adam(params, lr=0.001, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0,
+decay_bias=False)` holds a paired lazy moment record per binding and one global
+step counter. Both moments initialize together; supported placement/dtype changes
+prepare and replace the pair together. Bare Adam supports CPU F32/F64 and CUDA
+F32. Public state_dict serializes `m`/`v` lists, but those lists are not separate
+runtime parameter owners. Prepared loading validates count, shape, moment pairing
+and current/intended future placement before publication. Optimizer-only loading
+cannot relocate bound parameters through conflicting map_location.
 
-`Module.to(device)`, `Module.cast(dtype)`, and the `half()` / `bfloat16()`
-shorthands walk the tree and transform parameters and buffers in place,
-returning `self`. Public `to()` and floating `cast()` are differentiable
-tensor ops, so these model-state transformations run under explicit `no_grad`
-regions and re-assert `requires_grad` — every moved parameter stays a detached
-leaf rather than picking up a graph edge.
-
-## Layers
-
-All composition-based — no layer owns a private kernel; each is a `forward()`
-over public ops:
-
-| Group | Modules |
-| --- | --- |
-| Core | `Linear`, `Sequential`, `Flatten`, `FusedLinearReLU` |
-| Activations | `ReLU`, `Sigmoid`, `Tanh`, `LeakyReLU`, `GELU` |
-| Convolutional | `Conv2d`, `MaxPool2d` |
-| Normalization | `LayerNorm`, `BatchNorm1d`, `BatchNorm2d` |
-| Regularization | `Dropout` (inverted, native CPU/CUDA masks) |
-| Embedding | `Embedding` (with `padding_idx` gradient skipping) |
-| Attention | `SelfAttention`, `MultiHeadSelfAttention`, `TransformerEncoderBlock` |
-| Loss | `NLLLoss` (plus functional `ortho.cross_entropy`, `ortho.nll_loss`) |
-
-Notes that matter when composing them:
-
-- `Linear` takes 2-D input `[N, in_features]`; the Transformer block flattens
-  `[B, T, E] → [B*T, E]` around its linear layers.
-- `TransformerEncoderBlock` is pre-norm
-  (`x + dropout(MHA(LN(x)))`, then the GELU MLP), built from LayerNorm,
-  multi-head attention, Dropout and Linear — no fused attention or LayerNorm
-  kernels.
-- `ortho.cross_entropy(logits, targets)` takes targets as a Python sequence of
-  class indices; `ortho.nll_loss(log_probs, targets, reduction=...)` accepts
-  an index tensor or sequence, with `mean`/`sum`/`none` reductions.
-- BatchNorm is composition-based over Tensor reductions and elementwise
-  operations, so its statistics stay on the input's device (CPU or CUDA).
-  Running statistics are detached through explicit no-grad same-device Tensor
-  snapshots — no host round-trip. There is no dedicated fused BatchNorm CUDA
-  kernel (see [cuda_coverage.md](cuda_coverage.md)).
-
-## Initialization and RNG
-
-Layers draw initial weights (e.g. `Linear`'s Kaiming-uniform init) from **one
-framework-local RNG stream** (`python/orthon/_random.py`) — deliberately not
-Python's global `random` state, so unrelated user code shuffling a dataset
-cannot silently shift model initialization, and seeding Orthon cannot disturb
-the user's own sampling.
-
-```python
-ortho.manual_seed(7)   # opt-in determinism for module initialization
-```
-
-`manual_seed` resets that one stream and nothing else — not NumPy, not
-PyTorch, not CUDA device state, not existing tensors. A distributed user who
-wants rank-specific initialization calls `manual_seed(base + rank)`. Dropout
-additionally supports per-module deterministic seeding; there is no global
-stream-aware RNG system beyond this.
-
-## Optimizers
-
-`optim.SGD` and `optim.Adam` hold a list of parameter tensors and step them
-inside `no_grad` using in-place ops, so a step never enters the autograd
-graph.
-
-- **`SGD(params, lr, weight_decay=0.0, decay_bias=False)`** — plain
-  `p -= lr * grad` (no momentum), with decoupled weight decay that skips 1-D
-  (bias-shaped) parameters unless `decay_bias=True`.
-- **`Adam(params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0,
-  decay_bias=False)`** — standard bias-corrected moments; moment tensors are
-  created lazily on the parameter's own device at the first step, and the
-  weight decay is decoupled (AdamW-style).
-
-Both expose `get_lr()` / `set_lr()` for epoch-boundary schedules, and
-`state_dict()` / `load_state_dict()` for resume. Optimizer state restored from
-a checkpoint lands on the parameters' current devices.
-
-`orthon.training` adds three small loop helpers used by the examples —
-`train_step`, `eval_step`, `weighted_metric_average` — for supervised
-classification; they are conveniences, not a trainer framework.
+Both optimizers provide `zero_grad`, `step`, `get_lr`, `set_lr`, `state_dict` and
+`load_state_dict`. Gradients accumulate until cleared. Normal step execution is
+not a whole-optimizer transaction for arbitrary runtime exceptions.
 
 ## Mixed precision
 
-`orthon.amp` implements explicit-cast mixed precision: FP16 or BF16 forward
-and backward, FP32 optimizer mathematics. There is **no autocast** — the
-model is converted once with `model.half()` / `model.bfloat16()`, and inputs
-are cast at the boundary.
+`python/orthon/amp/optimizer.py` stores one immutable state entry per model owner:
+current model dtype, exact device, FP32 master and parameter owner. FP32 model
+owners are their own masters. F16/BF16 owners use distinct detached FP32 masters.
+The inner optimizer binds to these masters. Supported Module transforms reconcile
+lazily; prepared state loading builds all needed masters and inner state before
+publication. Explicit parameter replacement does not retarget existing bindings.
+Master/model synchronization requires matching shape/exact device and contiguous
+representations.
 
-**`MixedPrecisionOptimizer(model, OptimizerCls, **kwargs)`** creates an FP32
-**master copy** of every low-precision parameter (a detached leaf, snapshotted
-under `no_grad`) and hands the masters to the inner optimizer. Each `step()`
-casts low-precision gradients up to FP32, steps the masters, and casts the
-result back into the model. FP32 parameters skip the machinery entirely — the
-master *is* the model parameter, so an FP32 model pays no copy overhead.
+There is no autocast. Low-precision compute is principally CUDA; cast the model
+and inputs explicitly. GradScaler supports scale, idempotent unscale/finiteness
+checking, finite step, nonfinite skip/backoff and growth. Adaptation occurs in
+`step`; `update()` clears cycle bookkeeping. One enabled optimizer participates
+per cycle. Disabled mode calls the wrapper step and is suitable for BF16.
+A scaler state dictionary can be saved explicitly in checkpoint metadata, but
+restore does not apply it automatically.
 
-**`GradScaler`** adds dynamic loss scaling for FP16, whose narrow exponent
-range lets small gradients underflow to zero:
+## AMP with DDP
 
-- `scale(loss)` multiplies by the current scale — a Python-scalar multiply, so
-  no loss-shaped constant tensor is built;
-- `unscale_(opt)` divides FP32 master gradients by the scale and records
-  whether any are non-finite (idempotent, so explicit unscale-then-clip
-  works);
-- `step(opt)` unscales if that has not happened yet, synchronizes the
-  finite-gradient decision (across ranks under DDP), and then either skips the
-  optimizer update and backs the scale off (non-finite gradients found) or
-  steps the masters and grows the scale after `growth_interval` consecutive
-  clean steps — scale adaptation lives in `step()`, not `update()`;
-- `update()` clears the per-step unscale/finite state so the next iteration
-  starts fresh.
+Use `DDP(model, sync_grads=False)` before constructing MixedPrecisionOptimizer,
+then use GradScaler with that wrapper. Direct DDP low-precision gradient averaging
+is unsupported; the wrapper prepares and synchronizes FP32 master gradients.
+Ranks agree on nonfinite decisions for enabled scaling. Disabled scaling/BF16
+still synchronizes master gradients when a multi-rank group is active. Ordinary
+DDP captures its ProcessGroup at construction; AMP also retains its synchronization
+group and checks its lifetime. Follow the initialized group's lifetime through
+training, and destroy it after work completes. See [distributed](distributed.md).
 
-BF16 has float32's exponent range, so the BF16 path is
-`GradScaler(enabled=False)` — same loop shape, scaling off. Both the scaler
-and the mixed-precision optimizer expose `state_dict()`/`load_state_dict()`,
-so scale state and FP32 masters survive checkpoint/resume. Under DDP, ranks
-synchronize their non-finite-gradient decisions so all ranks skip (or step)
-together — see [ddp_cloud_validation.md](ddp_cloud_validation.md).
+## CPU training and checkpoint sample
 
-The dtype/kernel substrate this rides on (FP16/BF16 CUDA kernels, cuBLAS
-Tensor Core dispatch, CUDA cast coverage) is described in
-[cuda_runtime.md](cuda_runtime.md#cuda-dtype-support).
-
-## A complete training loop
-
-Synthetic two-class problem, CPU, with checkpoint/resume — every API here is
-the real one:
+This complete example uses only synthetic tensors and a temporary local archive:
 
 ```python
-import numpy as np
-import orthon as ortho
-from orthon.nn import Linear, ReLU, Sequential
-from orthon.optim import Adam
+import tempfile
+from pathlib import Path
+import orthon as o
 
-ortho.manual_seed(0)
-
-model = Sequential(Linear(16, 32), ReLU(), Linear(32, 2))
-opt = Adam(model.parameters(), lr=1e-2)
-
-rng = np.random.default_rng(0)
-features = rng.standard_normal((64, 16)).astype(np.float32)
-labels = [int(row[0] > 0) for row in features]        # class = sign of feature 0
-x = ortho.from_numpy(features)
-
-for step in range(20):
-    model.train()
-    opt.zero_grad()
-    loss = ortho.cross_entropy(model(x), labels)
-    loss.backward()
-    opt.step()
-
-ortho.save_checkpoint(
-    "mlp.ckpt", model=model, optimizer=opt, metadata={"step": 20},
-)
-
-# Later, or elsewhere: rebuild the architecture, then restore everything.
-model2 = Sequential(Linear(16, 32), ReLU(), Linear(32, 2))
-opt2 = Adam(model2.parameters(), lr=1e-2)
-meta = ortho.load_checkpoint("mlp.ckpt", model=model2, optimizer=opt2)
-assert meta["step"] == 20
-
-model2.eval()
-with ortho.no_grad():
-    logits = model2(x)
+model = o.nn.Sequential(o.nn.Linear(4, 8), o.nn.ReLU(), o.nn.Linear(8, 2))
+optimizer = o.optim.Adam(model.parameters(), lr=0.001)
+x = o.full([3, 4], 0.2)
+metrics = o.training.train_step(model, x, [0, 1, 0], o.cross_entropy, optimizer)
+print(metrics["loss"])
+with tempfile.TemporaryDirectory() as directory:
+    path = Path(directory) / "training.ckpt"
+    o.save_checkpoint(path, model=model, optimizer=optimizer, metadata={"step": 1})
+    resumed = o.nn.Sequential(o.nn.Linear(4, 8), o.nn.ReLU(), o.nn.Linear(8, 2))
+    resumed_optimizer = o.optim.Adam(resumed.parameters())
+    metadata = o.load_checkpoint(path, model=resumed, optimizer=resumed_optimizer)
+    print(metadata["step"])
 ```
 
-Moving this loop to CUDA is `model.to("cuda")` plus `x.to("cuda")`; making it
-mixed-precision is `model.half()` plus the `MixedPrecisionOptimizer` /
-`GradScaler` pair (the runnable CUDA AMP workload is
-[training_workloads.md](training_workloads.md#mixed-precision-smoke)).
+`training.train_step` trains, clears gradients, computes loss/backward and steps.
+`eval_step` sets evaluation mode but does not internally enter no_grad; callers
+can wrap evaluation explicitly. `classification_accuracy` expects `[N,C]` logits
+and integer targets; `weighted_metric_average` weights loss/accuracy by example
+count and rejects zero total examples.
 
 ## Checkpoint interaction
 
-`save_checkpoint(path, model=..., optimizer=..., metadata=...)` snapshots
-model state, optimizer state (including AMP masters and scaler state when you
-pass their owners' state through) and a metadata dict into one
-`ml-runtime-checkpoint` v1 archive; `load_checkpoint` validates the entire
-file before mutating anything and returns the metadata. Devices are a *load*
-policy: by default state loads onto the model's current devices, and
-`map_location="cuda:1"` overrides. The format's guarantees — no pickle,
-bit-exact round-trips, atomic saves — are specified in
-[checkpoint_format.md](checkpoint_format.md).
+The file facade delegates to private SerializationService and RestoreTransaction.
+The whole present known archive is decoded/validated, requested recipients are
+prepared, then model and optimizer commit in that order. Preparation receives
+intended future parameter placement, enabling supported combined device remapping
+without breaking optimizer owner references. Synchronous commit errors attempt
+reverse rollback, including the failing participant. This is not recovery from
+arbitrary asynchronous CUDA hardware faults.
 
-## Boundaries
+The archive stores model, optimizer and metadata only. Training mode, gradients,
+RNG, GradScaler, ProcessGroup and Reducer state are not automatically restored.
+File payloads do not reconstruct a source alias graph; destination ties are
+preserved. See [checkpoint format](checkpoint_format.md).
 
-- No autocast, no learning-rate scheduler objects (schedules are a few lines
-  over `set_lr`), no parameter groups, no gradient clipping helper (clip
-  between `unscale_` and `step` by hand), no momentum SGD.
-- No trainer/loop abstraction; the examples own their loops.
-- DDP wraps this stack from the outside via post-accumulate gradient hooks —
-  the layers and optimizers are unaware of it.
+## RNG and application scope
+
+`manual_seed(seed)` resets the framework-local Python initialization/dropout seed
+stream in `python/orthon/_random.py`; it does not reset NumPy, PyTorch, CUDA global
+state or provide a generator object API. LayerNorm, BatchNorm and attention are
+compositions of supported primitives. Linear is 2-D; attention reshapes its
+projections and uses equal-batch 3-D matmul. The current runtime provides neither
+higher-order autograd nor a general framework parity contract. Runnable workload
+boundaries are in [training workloads](training_workloads.md).

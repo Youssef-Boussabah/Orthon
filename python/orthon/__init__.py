@@ -30,7 +30,6 @@ from ._C import (  # noqa: F401
     mul,
     sub,
     div,
-    _scalar_like,
     reshape,
     transpose,
     contiguous,
@@ -63,16 +62,6 @@ from ._C import (  # noqa: F401
     nll_loss,
     conv2d,
     maxpool2d,
-    _memory_pool_set_enabled,
-    _memory_pool_enabled,
-    _memory_pool_set_max_cached_bytes,
-    _memory_pool_max_cached_bytes,
-    _memory_pool_scratch_allocate,
-    _memory_pool_reset_scratch,
-    _memory_pool_scratch_stats,
-    _memory_pool_reset_stats,
-    _memory_pool_clear_cache,
-    _memory_pool_stats,
     _amp_unscale_to_float32_and_check,
     _amp_copy_master_to_model_,
     _tensor_to_bytes,
@@ -116,26 +105,13 @@ def no_grad():
     finally:
         set_grad_enabled(previous)
 
-# CUDA-only benchmark helpers (None in CPU-only builds).
+# Optional distributed build capability.
 from . import _C as _Cmod  # noqa: F401
 nccl_enabled = getattr(_Cmod, 'nccl_enabled', lambda: False)
-_matmul_naive = getattr(_Cmod, '_matmul_naive', None)
-_matmul_tiled = getattr(_Cmod, '_matmul_tiled', None)
-_matmul_tiled_custom = getattr(_Cmod, '_matmul_tiled_custom', None)
-_matmul_tiled_cublas = getattr(_Cmod, '_matmul_tiled_cublas', None)
-_matmul_batched_tiled_custom = getattr(_Cmod, '_matmul_batched_tiled_custom', None)
-_matmul_batched_tiled_cublas = getattr(_Cmod, '_matmul_batched_tiled_cublas', None)
-_matmul_uses_cublas = getattr(_Cmod, '_matmul_uses_cublas', None)
-_matmul_dispatch_path = getattr(_Cmod, '_matmul_dispatch_path', None)
-_matmul_cublas_guard_report = getattr(_Cmod, '_matmul_cublas_guard_report', None)
-_matmul_cublas_elapsed_ms = getattr(_Cmod, '_matmul_cublas_elapsed_ms', None)
-_matmul_cublas_profile_report = getattr(_Cmod, '_matmul_cublas_profile_report', None)
-cuda_conv2d_profile_reset = getattr(_Cmod, '_conv2d_cuda_profile_reset', None)
-cuda_conv2d_profile_summary = getattr(_Cmod, '_conv2d_cuda_profile_summary', None)
 
 from ._random import manual_seed  # noqa: F401
 from . import nn, optim, training, amp  # noqa: F401
-# All four file APIs come from the ONE codec in checkpoint.py. There is no
+# All four file APIs come from the one codec in checkpoint.py. There is no
 # second serialization path to fall out of step with it.
 from .checkpoint import (  # noqa: F401
     save_state_dict,

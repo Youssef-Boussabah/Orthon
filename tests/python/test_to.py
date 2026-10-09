@@ -1,3 +1,4 @@
+from tests.support.capabilities import orthon_cuda_available as _cuda_available
 import pytest
 import orthon as ortho
 from orthon import Device, DeviceType
@@ -5,12 +6,6 @@ from orthon import Device, DeviceType
 cpu = Device(DeviceType.CPU, 0)
 
 
-def _cuda_available():
-    try:
-        ortho.zeros([1]).to("cuda")
-        return True
-    except RuntimeError:
-        return False
 
 
 no_cuda = pytest.mark.skipif(_cuda_available(), reason="CUDA is available")

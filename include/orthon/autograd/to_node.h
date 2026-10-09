@@ -3,24 +3,10 @@
 
 namespace orthon {
 
-// Backward of the public Tensor::to(device).
-//
-// Forward is a physical contiguous copy whose values equal the input in
-// LOGICAL order - same shape, same dtype, possibly a different Device. The
-// derivative is therefore identity in logical tensor coordinates, and
-// backward only has to return the gradient to the source device:
-//
-//     grad_input = grad_output.to(input.device())
-//
-// Tensor::backward runs the whole traversal under NoGradGuard, so this
-// recursive public to() call attaches no graph of its own. It also
-// materialises a strided upstream gradient into logical contiguous order,
-// which is exactly the coordinate system the input's own upstream nodes
-// (e.g. TransposeNode) expect.
-//
-// Value-insensitive by construction: the derivative never reads the
-// input's stored values, so no watch_version - mutating the source after
-// forward stays legal unless some downstream value-sensitive node saved it.
+// Transfer backward returns the gradient to the exact source device in
+// logical order. The public to() call runs under NoGradGuard and materializes
+// strided gradients. Its derivative reads no saved values, so source
+// mutation does not require a version watch.
 class ToNode : public Node {
 public:
     explicit ToNode(const Tensor& input) {

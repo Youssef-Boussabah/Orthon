@@ -42,15 +42,18 @@ def test_empty_float64_dtype():
 # Binary ops.
 
 def test_add_float64_forward():
-    a = _da64(A2); b = _da64(B2)
+    a = _da64(A2)
+    b = _da64(B2)
     out = ortho.add(a, b)
     assert out.dtype == "float64"
     np.testing.assert_allclose(_np(out), A2 + B2, atol=ATOL)
 
 
 def test_add_float64_backward():
-    a = _da64(A2, grad=True); b = _da64(B2, grad=True)
-    a_pt = _pt64(A2, grad=True); b_pt = _pt64(B2, grad=True)
+    a = _da64(A2, grad=True)
+    b = _da64(B2, grad=True)
+    a_pt = _pt64(A2, grad=True)
+    b_pt = _pt64(B2, grad=True)
     ortho.sum(ortho.add(a, b)).backward()
     (a_pt + b_pt).sum().backward()
     np.testing.assert_allclose(_np(a.grad), a_pt.grad.numpy(), atol=ATOL)
@@ -58,15 +61,18 @@ def test_add_float64_backward():
 
 
 def test_mul_float64_forward():
-    a = _da64(A2); b = _da64(B2)
+    a = _da64(A2)
+    b = _da64(B2)
     out = ortho.mul(a, b)
     assert out.dtype == "float64"
     np.testing.assert_allclose(_np(out), A2 * B2, atol=ATOL)
 
 
 def test_mul_float64_backward():
-    a = _da64(A2, grad=True); b = _da64(B2, grad=True)
-    a_pt = _pt64(A2, grad=True); b_pt = _pt64(B2, grad=True)
+    a = _da64(A2, grad=True)
+    b = _da64(B2, grad=True)
+    a_pt = _pt64(A2, grad=True)
+    b_pt = _pt64(B2, grad=True)
     ortho.sum(ortho.mul(a, b)).backward()
     (a_pt * b_pt).sum().backward()
     np.testing.assert_allclose(_np(a.grad), a_pt.grad.numpy(), atol=ATOL)
@@ -101,18 +107,29 @@ def _unary_bwd(da_fn, pt_fn, x=X):
     np.testing.assert_allclose(_np(t.grad), t_pt.grad.numpy(), atol=1e-11)
 
 
-def test_neg_float64():       _unary_fwd(ortho.neg,       lambda x: -x)
-def test_relu_float64_fwd():  _unary_fwd(ortho.relu,      torch.relu)
-def test_relu_float64_bwd():  _unary_bwd(ortho.relu,      torch.relu,
+def test_neg_float64():
+    _unary_fwd(ortho.neg,       lambda x: -x)
+def test_relu_float64_fwd():
+    _unary_fwd(ortho.relu,      torch.relu)
+def test_relu_float64_bwd():
+    _unary_bwd(ortho.relu,      torch.relu,
                                           x=np.array([-1.0, 0.5, 2.0, -0.1]))
-def test_sigmoid_float64_fwd(): _unary_fwd(ortho.sigmoid, torch.sigmoid)
-def test_sigmoid_float64_bwd(): _unary_bwd(ortho.sigmoid, torch.sigmoid)
-def test_tanh_float64_fwd():  _unary_fwd(ortho.tanh,      torch.tanh)
-def test_tanh_float64_bwd():  _unary_bwd(ortho.tanh,      torch.tanh)
-def test_exp_float64_fwd():   _unary_fwd(ortho.exp,       torch.exp)
-def test_exp_float64_bwd():   _unary_bwd(ortho.exp,       torch.exp)
-def test_sqrt_float64_fwd():  _unary_fwd(ortho.sqrt,      torch.sqrt)
-def test_sqrt_float64_bwd():  _unary_bwd(ortho.sqrt,      torch.sqrt)
+def test_sigmoid_float64_fwd():
+    _unary_fwd(ortho.sigmoid, torch.sigmoid)
+def test_sigmoid_float64_bwd():
+    _unary_bwd(ortho.sigmoid, torch.sigmoid)
+def test_tanh_float64_fwd():
+    _unary_fwd(ortho.tanh,      torch.tanh)
+def test_tanh_float64_bwd():
+    _unary_bwd(ortho.tanh,      torch.tanh)
+def test_exp_float64_fwd():
+    _unary_fwd(ortho.exp,       torch.exp)
+def test_exp_float64_bwd():
+    _unary_bwd(ortho.exp,       torch.exp)
+def test_sqrt_float64_fwd():
+    _unary_fwd(ortho.sqrt,      torch.sqrt)
+def test_sqrt_float64_bwd():
+    _unary_bwd(ortho.sqrt,      torch.sqrt)
 def test_gelu_float64_fwd():
     _unary_fwd(ortho.gelu, lambda x: torch.nn.functional.gelu(x))
 def test_gelu_float64_bwd():
@@ -206,8 +223,10 @@ def test_matmul_float64_forward():
 def test_matmul_float64_backward():
     a = np.random.default_rng(2).standard_normal((3, 4))
     b = np.random.default_rng(3).standard_normal((4, 5))
-    a_da = _da64(a, grad=True); b_da = _da64(b, grad=True)
-    a_pt = _pt64(a, grad=True); b_pt = _pt64(b, grad=True)
+    a_da = _da64(a, grad=True)
+    b_da = _da64(b, grad=True)
+    a_pt = _pt64(a, grad=True)
+    b_pt = _pt64(b, grad=True)
     ortho.sum(ortho.matmul(a_da, b_da)).backward()
     (a_pt @ b_pt).sum().backward()
     np.testing.assert_allclose(_np(a_da.grad), a_pt.grad.numpy(), atol=1e-10)

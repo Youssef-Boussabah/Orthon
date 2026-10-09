@@ -18,7 +18,7 @@ enum class DType {
 size_t dtype_size(DType dtype);
 
 // True for the four floating-point dtypes (Float32/Float64/Float16/BFloat16).
-// Device/dtype conversion is differentiable ONLY between floating dtypes;
+// Device/dtype conversion is differentiable only between floating dtypes;
 // integer/bool conversions never join a graph.
 bool dtype_is_floating(DType dtype);
 

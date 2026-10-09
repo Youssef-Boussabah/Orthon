@@ -1,6 +1,10 @@
 from abc import ABC, abstractmethod
 
 
+class _TransportFailure(RuntimeError):
+    """A collective entered its ordering sequence and failed."""
+
+
 class Backend(ABC):
     @property
     @abstractmethod
@@ -52,7 +56,11 @@ def get_backend_factory(name):
 
 class _SingleRankBackend(Backend):
     def __init__(self, *args, **kwargs):
-        pass
+        self._closed = False
+
+    def _ensure_open(self):
+        if self._closed:
+            raise RuntimeError("single-rank backend has been shut down")
 
     @property
     def rank(self):
@@ -63,6 +71,7 @@ class _SingleRankBackend(Backend):
         return 1
 
     def all_reduce(self, tensor, op="sum", async_op=False):
+        self._ensure_open()
         if async_op:
             from .work import _CompletedWork
 
@@ -70,6 +79,7 @@ class _SingleRankBackend(Backend):
         return tensor
 
     def broadcast(self, tensor, src=0, async_op=False):
+        self._ensure_open()
         if src != 0:
             raise ValueError("single-rank backend only supports src=0")
         if async_op:
@@ -79,9 +89,11 @@ class _SingleRankBackend(Backend):
         return tensor
 
     def barrier(self):
+        self._ensure_open()
         return None
 
     def shutdown(self):
+        self._closed = True
         return None
 
 

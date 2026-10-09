@@ -1,7 +1,7 @@
 #pragma once
 
 #include <orthon/autograd/node.h>
-#include <orthon/ops/cpu/nll_loss_ops.h>
+#include <orthon/ops/nll_loss_ops.h>
 #include <string>
 #include <vector>
 

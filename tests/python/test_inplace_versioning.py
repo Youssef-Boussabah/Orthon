@@ -1,50 +1,14 @@
-"""In-place mutation version counters and saved-tensor safety.
+"""Shared storage versions and selective saved-value mutation checks.
 
-Without version tracking, a tensor participating in an autograd graph can have
-its underlying storage mutated after forward and backward silently consumes the
-changed values::
-
-    x.requires_grad_(True)
-    y = orthon.tanh(x)
-    x.mul_(3.0)
-    y.backward()          # tanh'(3x) instead of tanh'(x), no warning
-
-The same holds through every alias (slice/index/transpose/reshape views share
-the Storage) and for mutated intermediates. ``Storage`` therefore carries a
-monotonically increasing version counter - bumped exactly once per successful
-logical in-place mutation - and the Node layer does SELECTIVE saved-version
-tracking: a Node watches precisely the saved tensors whose VALUES its backward
-formula consumes, and ``Tensor::backward`` validates every watched version in
-a whole-graph preflight (before any gradient state is touched) plus again
-immediately before each Node runs.
-
-Selectivity is the load-bearing property this file guards:
-
-* ``add``, ``sum``/``mean``, ``reshape``/``transpose``/``slice``/``index``/
-  ``contiguous``, ``neg`` and ``max`` (which scatters by its SAVED argmax
-  buffer) use only shapes/metadata/saved indices, so mutating their inputs
-  after forward stays legal;
-* ``mul``, ``matmul``, the value-using activations, ``softmax``/
-  ``log_softmax``, ``cross_entropy``, ``conv2d`` (input/weight but NOT bias),
-  ``maxpool2d``, ``fused_linear_relu`` (bias INCLUDED - the preactivation is
-  recomputed), ``embedding`` (the saved indices, NOT the weight payload) and
-  ``nll_loss`` (targets, NOT log_probs) must reject stale values;
-* version tracking is orthogonal to ``requires_grad``: a non-grad constant
-  consumed by value is watched all the same.
-
-``Tensor._storage_version`` is an underscore-private read-only diagnostic used
-here to prove exactly-once bump semantics; it is not a public versioning API.
-
-Mutation-before-forward remains fully legal: the graph captures the version at
-save time, and a mismatch means "mutated AFTER the saved forward state", never
-"has ever been mutated".
-"""
+Value-sensitive Nodes reject stale inputs before gradient publication;
+shape-only derivatives permit mutations. Aliases share exactly-once version bumps."""
+from tests.support.capabilities import orthon_cuda_available
 import numpy as np
 import pytest
 
 import orthon as ortho
 
-CUDA = ortho.cuda_enabled()
+CUDA = orthon_cuda_available()
 DEVICES = ["cpu"] + (["cuda"] if CUDA else [])
 requires_cuda = pytest.mark.skipif(not CUDA, reason="CUDA not available")
 
@@ -69,18 +33,7 @@ def _cpu_list(t):
     return t.tolist()
 
 
-def _mutate(t, device):
-    """Mutate a float32 tensor in-place through an API legal on `device`."""
-    if device == "cpu" and not t.is_contiguous:
-        ortho.fill_(t, 123.0)          # strided CPU writes: only fill_ supports them
-    else:
-        t.mul_(3.0)                 # contiguous CPU/CUDA
-
-
-# ---------------------------------------------------------------------------
 # Storage version counter contract
-# ---------------------------------------------------------------------------
-
 class TestVersionCounterContract:
     @pytest.mark.parametrize("device", DEVICES)
     def test_new_tensor_starts_at_version_zero(self, device):
@@ -200,10 +153,7 @@ class TestVersionCounterContract:
         assert e2._storage_version == 0
 
 
-# ---------------------------------------------------------------------------
 # Stale detection per value-sensitive Node family
-# ---------------------------------------------------------------------------
-
 class TestValueSensitiveNodesRejectStaleStorage:
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("side", ["lhs", "rhs"])
@@ -331,10 +281,7 @@ class TestValueSensitiveNodesRejectStaleStorage:
             y.backward()
 
 
-# ---------------------------------------------------------------------------
 # Selectivity: mathematically safe mutations stay legal
-# ---------------------------------------------------------------------------
-
 class TestValueInsensitiveNodesAllowMutation:
     @pytest.mark.parametrize("device", DEVICES)
     def test_add_backward_survives_operand_mutation(self, device):
@@ -408,7 +355,7 @@ class TestValueInsensitiveNodesAllowMutation:
     @pytest.mark.parametrize("device", DEVICES)
     def test_conv2d_bias_mutation_stays_legal(self, device):
         # Verified against both backends: grad_bias is a reduction of
-        # grad_output alone, so the bias PAYLOAD is not watched.
+        # grad_output alone, so the bias payload is not watched.
         x = _t(np.arange(16.0).reshape(1, 1, 4, 4), device, grad=True)
         w = _t(np.ones((1, 1, 3, 3)), device, grad=True)
         b = _t([0.5], device, grad=True)
@@ -445,10 +392,7 @@ class TestValueInsensitiveNodesAllowMutation:
             [0.0, 0.0, -0.5, -0.5, 0.0, 0.0])
 
 
-# ---------------------------------------------------------------------------
 # Alias propagation: every view family, both directions
-# ---------------------------------------------------------------------------
-
 class TestAliasMutationPropagation:
     @pytest.mark.parametrize("device", DEVICES)
     @pytest.mark.parametrize("family", ["slice", "index", "reshape", "chained"])
@@ -508,10 +452,7 @@ class TestAliasMutationPropagation:
             y.backward()
 
 
-# ---------------------------------------------------------------------------
 # Central validation ordering and failed-mutation hygiene
-# ---------------------------------------------------------------------------
-
 class TestBackwardValidationOrdering:
     @pytest.mark.parametrize("device", DEVICES)
     def test_preflight_fires_before_any_leaf_grad_or_hook(self, device):
@@ -575,10 +516,7 @@ class TestBackwardValidationOrdering:
         assert _cpu_list(x.grad) == [4.0, 8.0]
 
 
-# ---------------------------------------------------------------------------
 # Version mismatch means "mutated AFTER the save", never "ever mutated"
-# ---------------------------------------------------------------------------
-
 class TestMutationBeforeForwardStaysLegal:
     @pytest.mark.parametrize("device", DEVICES)
     def test_mutate_then_build_graph_then_backward(self, device):
@@ -620,10 +558,7 @@ class TestMutationBeforeForwardStaysLegal:
         assert _cpu_list(x.grad) == [6.0, 8.0]
 
 
-# ---------------------------------------------------------------------------
 # Optimizer and load_state_dict interaction
-# ---------------------------------------------------------------------------
-
 def _linear_model_and_loss(device):
     import orthon.nn as nn
     model = nn.Linear(2, 2)
@@ -701,10 +636,7 @@ class TestLoadStateDictInteraction:
         assert model.weight.grad is not None
 
 
-# ---------------------------------------------------------------------------
 # AMP mutation coverage
-# ---------------------------------------------------------------------------
-
 class TestAmpCopyMutation:
     @requires_cuda
     def test_amp_master_to_model_copy_bumps_once_and_invalidates(self):
@@ -726,10 +658,7 @@ class TestAmpCopyMutation:
         assert _cpu_list(grad) == [2.0, 4.0]
 
 
-# ---------------------------------------------------------------------------
 # Distributed (local backend) mutation coverage (single-process)
-# ---------------------------------------------------------------------------
-
 class TestLocalDistributedMutation:
     def test_local_broadcast_copy_bumps_destination(self):
         # The local backend's broadcast copies via _copy_flat_range_from, so

@@ -1,25 +1,7 @@
-"""Framework RNG and deterministic initialization.
+"""Deterministic framework RNG streams independent of user random state.
 
-Every source of randomness in the framework - ``Linear``/``Conv2d``/
-``Embedding`` initialization, functional attention dropout, and
-``Dropout(seed=None)`` - draws from one framework-owned generator, reset by
-``orthon.manual_seed()``. Drawing from Python's *global* generator instead
-would let unrelated user code shift model initialization, and reaching for
-``secrets.randbits`` would put a default ``Dropout`` beyond any seed at all,
-making a model containing one impossible to reproduce.
-
-The contract these tests pin is a **stream**, not a per-layer constant:
-``manual_seed`` resets one shared stream and individual layers never reseed it,
-so consecutive same-shaped layers stay statistically distinct while the whole
-sequence reproduces after a reseed. A per-layer constant seed would make
-``Linear(8, 8)`` twice in a row produce identical weights -- the failure mode
-this design exists to avoid, and which ``test_consecutive_layers_differ`` would
-catch.
-
-The generator is deliberately NOT seeded at import: determinism is opt-in.
-That is asserted by source inspection rather than statistically -- a test that
-two runs differ could fail by coincidence, which is the wrong contract test.
-"""
+Layers consume consecutive values without reseeding; determinism is opt-in."""
+from tests.support.capabilities import orthon_cuda_available
 import math
 import os
 import random
@@ -30,7 +12,7 @@ import pytest
 import orthon as ortho
 from orthon.nn import (Conv2d, Dropout, Embedding, FusedLinearReLU, Linear)
 
-CUDA = ortho.cuda_enabled()
+CUDA = orthon_cuda_available()
 requires_cuda = pytest.mark.skipif(not CUDA, reason="CUDA not available")
 
 
@@ -46,10 +28,7 @@ def _same(a, b):
     return len(a) == len(b) and all(np.array_equal(x, y) for x, y in zip(a, b))
 
 
-# --------------------------------------------------------------------------
 # Public API
-# --------------------------------------------------------------------------
-
 def test_manual_seed_is_public_and_returns_none():
     assert callable(ortho.manual_seed)
     assert ortho.manual_seed(0) is None
@@ -71,10 +50,7 @@ def test_manual_seed_does_not_touch_existing_tensors():
     assert _v(layer.weight) == pytest.approx(before, abs=0)
 
 
-# --------------------------------------------------------------------------
 # Reproducible initialization, per module type
-# --------------------------------------------------------------------------
-
 BUILDERS = {
     "Linear": lambda: Linear(12, 7),
     "FusedLinearReLU": lambda: FusedLinearReLU(12, 7),
@@ -130,10 +106,7 @@ def test_embedding_padding_row_stays_zero_across_reseeds():
         assert np.all(w[0] == 0.0)
 
 
-# --------------------------------------------------------------------------
 # Stream progression -- the heart of the contract
-# --------------------------------------------------------------------------
-
 def test_consecutive_layers_differ():
     """A per-layer constant seed would make these identical."""
     ortho.manual_seed(123)
@@ -174,10 +147,7 @@ def test_a_layer_does_not_reseed_the_stream():
     assert not np.array_equal(one, two)
 
 
-# --------------------------------------------------------------------------
 # Isolation from Python's global random
-# --------------------------------------------------------------------------
-
 def test_python_random_activity_cannot_perturb_orthon():
     ortho.manual_seed(123)
     expected = _v(Linear(6, 5).weight)
@@ -223,10 +193,7 @@ def test_manual_seed_does_not_seed_numpy():
     assert np.random.rand(4).tolist() == expected
 
 
-# --------------------------------------------------------------------------
 # Dropout
-# --------------------------------------------------------------------------
-
 def test_default_dropout_seed_is_reproducible():
     ortho.manual_seed(5)
     d1 = Dropout(0.5)
@@ -305,10 +272,7 @@ def test_dropout_in_eval_mode_is_identity_and_draws_nothing():
     assert d._counter == 0
 
 
-# --------------------------------------------------------------------------
 # Functional attention dropout
-# --------------------------------------------------------------------------
-
 def _qkv(dev="cpu"):
     rng = np.random.default_rng(0)
     out = []
@@ -368,10 +332,7 @@ def test_enabled_attention_dropout_does_advance_the_stream():
     assert not np.array_equal(after_call, no_call)
 
 
-# --------------------------------------------------------------------------
 # Full-model reproducibility
-# --------------------------------------------------------------------------
-
 def test_a_model_containing_dropout_is_fully_reproducible():
     """Dropout's default seed comes from the framework generator, so a
     model containing one reproduces. A secrets.randbits default would put it
@@ -415,10 +376,7 @@ def test_adam_convergence_model_is_deterministic():
     assert b[0] - b[1] > 0.01
 
 
-# --------------------------------------------------------------------------
 # Source-level contract
-# --------------------------------------------------------------------------
-
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 RUNTIME = os.path.join(REPO, "python", "orthon")
 

@@ -1,33 +1,9 @@
-"""Parameter load_state_dict correctness and identity preservation.
+"""State loading retains parameter owners and copies destination-authoritative values.
 
-``state_dict()`` returns the module's LIVE tensor objects -- that is its
-contract. The loader is what has to be safe.
-
-The contract is destination-authoritative: the incoming value is copied, moved
-to the destination's device, cast to the destination's dtype, and then written
-INTO the existing parameter. The parameter object never changes.
-
-Four failure modes are pinned here, because each is what a plainer loader
-produces:
-
-A. **Self-load corruption.** ``model.load_state_dict(model.state_dict())``
-   with a float path of ``current.mul_(0.0)`` then ``current.add_(src)``
-   silently zeroes every parameter: for a self-load ``src is current``, so the
-   zeroing destroys the source it is about to read.
-
-B. **Cross-device / cross-dtype.** Calling ``current.add_(src)`` without
-   reconciling device or dtype gives ``add_: device mismatch`` in both
-   directions and ``add_: dtype mismatch`` for float32 state into a float64
-   destination.
-
-C. **Low-precision aliasing.** Installing ``restored = src`` directly for
-   dtypes outside float32/float64 makes
-   ``destination.weight is source.weight`` **True**.
-
-D. **Parameter replacement.** Replacing the entry in ``_parameters`` instead
-   of copying into it leaves every external reference -- optimizers, hooks,
-   user aliases -- pointing at an orphan.
-"""
+Self-loads, aliases and dtype/device conversions must preserve optimizer bindings."""
+from tests.support.capabilities import orthon_cuda_available
+from tests.support.source import parse_python
+import ast
 import numpy as np
 import pytest
 
@@ -35,14 +11,14 @@ import orthon as ortho
 from orthon.nn import Linear, Sequential
 from orthon.optim import SGD
 
-CUDA = ortho.cuda_enabled()
+CUDA = orthon_cuda_available()
 requires_cuda = pytest.mark.skipif(not CUDA, reason="CUDA not available")
 
 
 def _fill(model, base=1.0):
     """Deterministic, distinctive, non-zero values.
 
-    Zeros would make defect A invisible, and uniform values would hide a
+    Zeros hide self-load corruption, and uniform values hide a
     transposed or partial copy.
     """
     for i, p in enumerate(model.parameters()):
@@ -64,10 +40,7 @@ def _params(model):
     return list(model.parameters())
 
 
-# --------------------------------------------------------------------------
 # Failure mode A: self-load
-# --------------------------------------------------------------------------
-
 def test_self_load_preserves_values_and_identity():
     """A self-load must not zero every parameter."""
     m = _fill(Linear(3, 2))
@@ -108,10 +81,7 @@ def test_repeated_self_load_is_idempotent():
         assert _v(p) == pytest.approx(b, abs=0)
 
 
-# --------------------------------------------------------------------------
 # Defects C/D: identity and independence
-# --------------------------------------------------------------------------
-
 def test_destination_parameter_objects_are_never_replaced():
     src = _fill(Linear(3, 2), base=2.0)
     dst = _fill(Linear(3, 2), base=90.0)
@@ -167,10 +137,7 @@ def test_cuda_float32_independence():
     assert np.abs(_v(dst.weight)).max() > 0.0
 
 
-# --------------------------------------------------------------------------
 # Failure mode B: cross-device
-# --------------------------------------------------------------------------
-
 @requires_cuda
 def test_cpu_state_loads_into_a_cuda_destination():
     """Without device reconciliation: RuntimeError: add_: device mismatch."""
@@ -211,10 +178,7 @@ def test_load_state_dict_does_not_move_the_destination_model():
         assert str(p.device) == "device('cuda:0')"
 
 
-# --------------------------------------------------------------------------
 # Cross-dtype
-# --------------------------------------------------------------------------
-
 def test_float32_state_into_float64_destination():
     """Without dtype reconciliation: RuntimeError: add_: dtype mismatch."""
     src = _fill(Linear(3, 2), base=2.0)
@@ -302,10 +266,7 @@ def test_narrow_precision_parameter_identity_is_preserved(meth, dtype):
     assert dst.weight.dtype == dtype
 
 
-# --------------------------------------------------------------------------
 # Device + dtype together
-# --------------------------------------------------------------------------
-
 @requires_cuda
 @pytest.mark.parametrize("meth,dtype,tol", [("half", "float16", 5e-2),
                                             ("bfloat16", "bfloat16", 5e-1)])
@@ -326,10 +287,7 @@ def test_cpu_float32_state_into_narrow_cuda_destination(meth, dtype, tol):
     assert _v(dst.weight) == pytest.approx(_v(src.weight), abs=tol)
 
 
-# --------------------------------------------------------------------------
 # Optimizer and hook safety
-# --------------------------------------------------------------------------
-
 def test_optimizer_references_survive_a_load():
     model = _fill(Linear(3, 2))
     opt = SGD(model.parameters(), lr=0.1)
@@ -394,10 +352,7 @@ def test_a_parameter_hook_registered_before_loading_still_fires():
     assert fired == [1]
 
 
-# --------------------------------------------------------------------------
 # Metadata and detached preparation
-# --------------------------------------------------------------------------
-
 def test_parameter_autograd_metadata_is_unchanged_by_loading():
     model = _fill(Linear(3, 2))
     before = [(p.requires_grad, p.is_leaf, p._has_grad_fn) for p in _params(model)]
@@ -432,10 +387,7 @@ def test_a_trainable_source_does_not_import_its_graph():
     assert dst.weight._has_grad_fn is False
 
 
-# --------------------------------------------------------------------------
 # Strict / non-strict / atomicity
-# --------------------------------------------------------------------------
-
 def test_strict_rejects_missing_and_unexpected_keys():
     model = Linear(3, 2)
     state = model.state_dict()
@@ -503,36 +455,34 @@ def test_a_malformed_later_entry_leaves_earlier_parameters_untouched(bad_value, 
 def test_preparation_loop_does_not_mutate():
     """Source-level companion to the test above: the prepare loop must contain
     no commit operation."""
-    import os
-    p = os.path.join(os.path.dirname(__file__), "..", "..",
-                     "python", "orthon", "nn", "module.py")
-    with open(p, encoding="utf-8") as f:
-        src = f.read()
-    body = src[src.index("def load_state_dict"):]
-    body = body[:body.index("def _replace_parameter")]
-    prepare = body[body.index("prepared = []"):body.index("# ---- Stage 2")]
+    tree = parse_python("python/orthon/nn/module.py")
+    module = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Module")
+    method = next(n for n in module.body if isinstance(n, ast.FunctionDef)
+                  and n.name == "_prepare_load_state_dict")
+    commit_index = next(i for i, n in enumerate(method.body)
+                        if isinstance(n, ast.FunctionDef) and n.name == "commit")
+    prepare = ast.unparse(ast.Module(body=method.body[:commit_index], type_ignores=[]))
     for forbidden in ("_copy_data_", "_parameters[", "_buffers[", ".mul_(", ".add_("):
         assert forbidden not in prepare, "prepare stage mutates: %s" % forbidden
 
 
 def test_parameters_are_copied_into_not_replaced():
     """Source-level: the commit stage must not assign into _parameters."""
-    import os
-    p = os.path.join(os.path.dirname(__file__), "..", "..",
-                     "python", "orthon", "nn", "module.py")
-    with open(p, encoding="utf-8") as f:
-        src = f.read()
-    body = src[src.index("def load_state_dict"):]
-    body = body[:body.index("def _replace_parameter")]
-    commit = body[body.index("# ---- Stage 2"):]
-    assert "_copy_data_" in commit
-    assert "owner._parameters[local_name] =" not in commit
+    tree = parse_python("python/orthon/nn/module.py")
+    module = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Module")
+    method = next(n for n in module.body if isinstance(n, ast.FunctionDef)
+                  and n.name == "_prepare_load_state_dict")
+    commit = next(n for n in method.body if isinstance(n, ast.FunctionDef) and n.name == "commit")
+    copy = next(n for n in module.body if isinstance(n, ast.FunctionDef)
+                and n.name == "_copy_state_value")
+    assert "_copy_state_value" in ast.unparse(commit)
+    assert "_copy_data_" in ast.unparse(copy)
+    assert not any(isinstance(n, ast.Subscript) and isinstance(n.ctx, ast.Store)
+                   and isinstance(n.value, ast.Attribute) and n.value.attr == "_parameters"
+                   for n in ast.walk(commit))
 
 
-# --------------------------------------------------------------------------
 # Buffers are replaced, and stay independent of the source
-# --------------------------------------------------------------------------
-
 def test_buffer_loading_still_replaces_and_stays_independent():
     from orthon.nn import BatchNorm1d
     src = BatchNorm1d(4)
@@ -564,10 +514,7 @@ def test_batchnorm_self_load_is_safe():
     assert m.weight is w_obj
 
 
-# --------------------------------------------------------------------------
 # The internal copy primitive itself
-# --------------------------------------------------------------------------
-
 def test_copy_data_rejects_mismatched_shape_dtype_and_device():
     a = ortho.ones([3, 2])
     with pytest.raises(RuntimeError):

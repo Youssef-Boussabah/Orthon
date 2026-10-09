@@ -5,9 +5,11 @@ Run with the distributed launcher for multi-rank NCCL measurements, for example:
         benchmarks/bench_amp_ddp_vs_fp32_ddp.py
 """
 
+from benchmarks._support.training import update_metadata, measured, configure, options, run as run_measurement
+from benchmarks._support.environment import synchronizer
+
 import argparse
 import os
-import time
 
 import orthon as ortho
 import orthon.distributed as ddist
@@ -64,8 +66,7 @@ def loss_fn(model, x):
 
 
 def sync(device):
-    if device.startswith("cuda"):
-        ortho.cuda_synchronize()
+    synchronizer(device, "orthon")()
 
 
 def scalar_float(tensor):
@@ -102,17 +103,17 @@ def run_fp32_ddp(args, device):
     ddist.barrier()
 
     last_loss = None
-    start = time.perf_counter()
-    for _ in range(args.steps):
-        ddp_model.zero_grad()
-        last_loss = loss_fn(ddp_model, x)
-        last_loss.backward()
-        if args.overlap:
-            ddp_model.wait_for_gradient_sync()
-        optimizer.step()
-    sync(device)
-    ddist.barrier()
-    elapsed = time.perf_counter() - start
+    with measured("bench_amp_ddp_vs_fp32_ddp:start:run_fp32_ddp", lambda: sync(device), calls=args.steps, device=device, implementation="orthon", dtype="float32", config=vars(args)) as _region_start:
+        for _ in range(args.steps):
+            ddp_model.zero_grad()
+            last_loss = loss_fn(ddp_model, x)
+            last_loss.backward()
+            if args.overlap:
+                ddp_model.wait_for_gradient_sync()
+            optimizer.step()
+        sync(device)
+        ddist.barrier()
+    elapsed = _region_start["seconds"]
     return {
         "ms_per_step": elapsed * 1000.0 / args.steps,
         "samples_per_sec": args.batch_size * ddist.get_world_size() * args.steps / elapsed,
@@ -137,16 +138,16 @@ def run_amp_ddp(args, device):
     ddist.barrier()
 
     last_loss = None
-    start = time.perf_counter()
-    for _ in range(args.steps):
-        optimizer.zero_grad()
-        last_loss = loss_fn(ddp_model, x)
-        scaler.scale(last_loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-    sync(device)
-    ddist.barrier()
-    elapsed = time.perf_counter() - start
+    with measured("bench_amp_ddp_vs_fp32_ddp:start:run_amp_ddp", lambda: sync(device), calls=args.steps, device=device, implementation="orthon", dtype="float16", config=vars(args)) as _region_start:
+        for _ in range(args.steps):
+            optimizer.zero_grad()
+            last_loss = loss_fn(ddp_model, x)
+            scaler.scale(last_loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        sync(device)
+        ddist.barrier()
+    elapsed = _region_start["seconds"]
     return {
         "ms_per_step": elapsed * 1000.0 / args.steps,
         "samples_per_sec": args.batch_size * ddist.get_world_size() * args.steps / elapsed,
@@ -170,7 +171,8 @@ def parse_args():
     parser.add_argument("--overlap", action="store_true")
     parser.add_argument("--init-scale", type=float, default=128.0)
     parser.add_argument("--growth-interval", type=int, default=2000)
-    args = parser.parse_args()
+    options(parser)
+    args = configure(parser.parse_args())
     if args.steps < 1:
         parser.error("--steps must be at least 1")
     if args.warmup_steps < 0:
@@ -184,6 +186,10 @@ def main():
     try:
         rank = ddist.get_rank()
         world_size = ddist.get_world_size()
+        update_metadata(backend="nccl",world_size=world_size,device_profile="cuda",
+            bucket_mode="bucketed",overlap=getattr(args,"overlap",args.mode=="overlap" if hasattr(args,"mode") else False),
+            batch_size=args.batch_size,warmup_steps=getattr(args,"warmup_steps",getattr(args,"warmup_iters",0)),
+            measured_steps=getattr(args,"steps",getattr(args,"timed_iters",0)))
         device = f"cuda:{local_rank()}"
         fp32 = run_fp32_ddp(args, device)
         amp = run_amp_ddp(args, device)
@@ -201,7 +207,7 @@ def main():
             print(f"amp_ddp_ms_per_step: {amp['ms_per_step']:.3f}")
             print(f"fp32_ddp_samples_per_sec: {fp32['samples_per_sec']:.2f}")
             print(f"amp_ddp_samples_per_sec: {amp['samples_per_sec']:.2f}")
-            print(f"speedup_vs_fp32_ddp: {speedup:.3f}")
+            print(f"unverified_region_ratio: {speedup:.3f}")
             print(f"fp32_ddp_final_loss: {fp32['final_loss']:.6f}")
             print(f"amp_ddp_final_loss: {amp['final_loss']:.6f}")
             print(f"scaler_final_scale: {amp['scaler_final_scale']:.1f}")
@@ -222,7 +228,7 @@ def main():
                 f"amp_ddp_ms_per_step={amp['ms_per_step']:.3f},"
                 f"fp32_ddp_samples_per_sec={fp32['samples_per_sec']:.2f},"
                 f"amp_ddp_samples_per_sec={amp['samples_per_sec']:.2f},"
-                f"speedup_vs_fp32_ddp={speedup:.3f},"
+                f"unverified_region_ratio={speedup:.3f},"
                 f"fp32_ddp_final_loss={fp32['final_loss']:.6f},"
                 f"amp_ddp_final_loss={amp['final_loss']:.6f},"
                 f"scaler_final_scale={amp['scaler_final_scale']:.1f}"
@@ -232,4 +238,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run_measurement(main, "bench_amp_ddp_vs_fp32_ddp")

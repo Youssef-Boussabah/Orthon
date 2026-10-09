@@ -1,26 +1,6 @@
-"""Runtime smoke test for an installed orthon wheel.
+"""Smoke an installed wheel using only its declared runtime dependencies.
 
-Run against a CLEAN environment that has the wheel and nothing else:
-
-    python -m venv /tmp/smoke && /tmp/smoke/bin/pip install dist/*.whl
-    /tmp/smoke/bin/python tests/smoke/package_smoke.py
-
-This is the same script the `package` job in .github/workflows/ci.yml runs, so
-CI and a local check exercise identical code rather than two drifting copies.
-
-What it is for - packaging correctness, pinned under automation:
-
-  * `import orthon` succeeds from a wheel install alone;
-  * the declared runtime dependency set is sufficient - NumPy is pulled in
-    transitively, nothing else is needed;
-  * torch and pytest are TEST-only dependencies and must not be required to
-    import or use the package. They are declared under
-    [project.optional-dependencies].test precisely so a normal install does not
-    drag a multi-gigabyte reference framework along.
-
-It deliberately uses no test framework: pytest is one of the things being
-proven unnecessary.
-"""
+Run this script in a clean wheel environment; Torch and pytest must be unnecessary."""
 import sys
 
 
@@ -29,7 +9,7 @@ def fail(message):
 
 
 # The environment must be clean, or this script proves less than it claims.
-# pickle is NOT on this list: NumPy imports it, so its presence in sys.modules
+# pickle is not on this list: NumPy imports it, so its presence in sys.modules
 # says nothing about orthon. The checkpoint section below proves the useful
 # property instead, by making every pickle entry point fatal.
 for forbidden in ("torch", "pytest"):
@@ -48,7 +28,7 @@ if "torch" in sys.modules:
 if "pytest" in sys.modules:
     fail("importing orthon pulled in pytest")
 
-# ---- create tensors ----
+# create tensors
 a = orthon.full([2, 3], 2.0)
 b = orthon.full([2, 3], 5.0)
 if tuple(a.shape) != (2, 3):
@@ -56,7 +36,7 @@ if tuple(a.shape) != (2, 3):
 if a.dtype != "float32":
     fail(f"unexpected dtype {a.dtype}")
 
-# ---- basic add / mul ----
+# basic add / mul
 # Tensor.tolist() is flat by contract, so compare against flat expectations.
 added = orthon.add(a, b).tolist()
 if added != [7.0] * 6:
@@ -66,7 +46,7 @@ multiplied = orthon.mul(a, b).tolist()
 if multiplied != [10.0] * 6:
     fail(f"mul produced {multiplied}")
 
-# ---- sub / div and the Python scalar operators ----
+# sub / div and the Python scalar operators
 subtracted = orthon.sub(b, a).tolist()
 if subtracted != [3.0] * 6:
     fail(f"sub produced {subtracted}")
@@ -88,11 +68,13 @@ for label, got, expected in (
     if got != expected:
         fail(f"{label} produced {got}, expected {expected}")
 
-# A scalar operand must not materialise a data-shaped temporary.
-if tuple(orthon._scalar_like(a, 2.0).shape) != ():
-    fail("scalar operand is not rank-0")
+# Retired diagnostics must not remain registered or re-exported.
+if hasattr(orthon, "_scalar_like") or hasattr(orthon._C, "_scalar_like"):
+    fail("retired scalar diagnostic is still exposed")
+if (a + 2.).dtype != a.dtype or (2. / a).device != a.device:
+    fail("public scalar arithmetic changed dtype or exact device")
 
-# ---- simple backward ----
+# simple backward
 x = orthon.full([3], 3.0)
 x.requires_grad_(True)
 w = orthon.full([3], 4.0)
@@ -102,7 +84,7 @@ if x.grad is None:
 if x.grad.tolist() != [4.0, 4.0, 4.0]:
     fail(f"d(x*w)/dx produced {x.grad.tolist()}, expected w")
 
-# ---- a composed graph, so the smoke covers more than one node ----
+# a composed graph, so the smoke covers more than one node
 y = orthon.full([4], 1.0)
 y.requires_grad_(True)
 negative = orthon.mul(y, orthon.full([4], -1.0))
@@ -110,7 +92,7 @@ orthon.relu(negative).sum().backward()
 if y.grad.tolist() != [0.0] * 4:
     fail(f"relu(-y) gradient was {y.grad.tolist()}, expected all zeros")
 
-# ---- checkpoint file APIs ----
+# checkpoint file APIs
 #
 # Worth proving from a clean install specifically because the format is
 # stdlib-only: zipfile + json + hashlib, no pickle, and no NumPy needed to

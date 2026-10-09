@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
-#include <orthon/ops/cpu/fill_ops.h>
-#include <orthon/ops/cpu/binary_ops.h>
-#include <orthon/ops/cpu/reduce_ops.h>
+#include <orthon/ops/fill_ops.h>
+#include <orthon/ops/binary_ops.h>
+#include <orthon/ops/reduce_ops.h>
 #include <orthon/core/tensor_impl.h>
 
 // The framework's public API lives in namespace orthon. Tests import it wholesale
@@ -129,9 +129,9 @@ TEST(BinaryOps, BroadcastMismatchThrows) {
     EXPECT_THROW(mul(a, b), std::runtime_error);
 }
 
-// ---- Leaf gradient ownership ----
+// Leaf gradient ownership
 //
-// AddNode returns the SAME gradient object for both of its inputs, because
+// AddNode returns the same gradient object for both of its inputs, because
 // both partial derivatives are the identity. That is correct arithmetic, but
 // two distinct leaves must still end up owning two distinct gradient buffers:
 // .grad is public mutable state (DDP rescales it, AMP unscales it), so a
@@ -147,12 +147,12 @@ TEST(BinaryOps, AddBackwardGivesEachLeafItsOwnGradStorage) {
     ASSERT_TRUE(a.has_grad());
     ASSERT_TRUE(b.has_grad());
 
-    // Distinct TensorImpls AND distinct Storages: sharing the buffer is what
+    // Distinct TensorImpls AND distinct Buffers: sharing the buffer is what
     // makes an in-place edit visible through the other leaf, so the buffer is
     // the thing that has to differ.
     EXPECT_NE(a.grad().impl().get(), b.grad().impl().get());
-    EXPECT_NE(a.grad().impl()->storage().get(),
-              b.grad().impl()->storage().get());
+    EXPECT_NE(a.grad().impl()->buffer().get(),
+              b.grad().impl()->buffer().get());
 
     // Values are d(sum(a+b))/da = d(.)/db = 1 everywhere.
     const auto* ga = static_cast<const float*>(a.grad().data());
@@ -196,8 +196,8 @@ TEST(BinaryOps, SecondBackwardAccumulatesAndStaysIndependent) {
     sum(add(a, b)).backward();
     sum(add(a, b)).backward();
 
-    EXPECT_NE(a.grad().impl()->storage().get(),
-              b.grad().impl()->storage().get());
+    EXPECT_NE(a.grad().impl()->buffer().get(),
+              b.grad().impl()->buffer().get());
 
     const auto* ga = static_cast<const float*>(a.grad().data());
     const auto* gb = static_cast<const float*>(b.grad().data());
@@ -220,8 +220,8 @@ TEST(BinaryOps, BroadcastAddBackwardKeepsCorrectGradients) {
 
     EXPECT_EQ(a.grad().shape(), (std::vector<int64_t>{2, 3}));
     EXPECT_EQ(b.grad().shape(), (std::vector<int64_t>{3}));
-    EXPECT_NE(a.grad().impl()->storage().get(),
-              b.grad().impl()->storage().get());
+    EXPECT_NE(a.grad().impl()->buffer().get(),
+              b.grad().impl()->buffer().get());
 
     const auto* ga = static_cast<const float*>(a.grad().data());
     for (int64_t i = 0; i < 6; ++i) EXPECT_FLOAT_EQ(ga[i], 1.0f);
@@ -230,7 +230,7 @@ TEST(BinaryOps, BroadcastAddBackwardKeepsCorrectGradients) {
 }
 
 // One leaf used twice in the same expression is a different situation: there
-// is only ONE leaf, so its gradient must ACCUMULATE to 2, not be privatised
+// is only one leaf, so its gradient must accumulate to 2, not be privatised
 // into two halves. Guards against over-applying the ownership rule.
 TEST(BinaryOps, SameLeafOnBothSidesAccumulates) {
     auto a = ones({2, 3});

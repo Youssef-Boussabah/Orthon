@@ -8,11 +8,11 @@
 #include <orthon/autograd/grad_mode.h>
 #include <orthon/autograd/node.h>
 #include <orthon/core/tensor_impl.h>
-#include <orthon/ops/cpu/binary_ops.h>
-#include <orthon/ops/cpu/fill_ops.h>
-#include <orthon/ops/cpu/reduce_ops.h>
-#include <orthon/ops/cpu/scalar_ops.h>
-#include <orthon/ops/cpu/shape_ops.h>
+#include <orthon/ops/binary_ops.h>
+#include <orthon/ops/fill_ops.h>
+#include <orthon/ops/reduce_ops.h>
+#include <orthon/ops/scalar_ops.h>
+#include <orthon/ops/shape_ops.h>
 
 #include <cmath>
 #include <stdexcept>
@@ -42,10 +42,7 @@ static Tensor from_f64(const std::vector<int64_t>& shape,
     return t;
 }
 
-// ---------------------------------------------------------------------------
 // full() no longer narrows its value through float32.
-// ---------------------------------------------------------------------------
-
 TEST(FullPrecision, Float64KeepsFullDoubleOneThird) {
     Tensor t = full({}, 1.0 / 3.0, DType::Float64, Device{});
     // Exact equality is the point: any float32 round-trip lands on
@@ -90,10 +87,7 @@ TEST(FullPrecision, OnesStillOnes) {
     for (int64_t i = 0; i < t.numel(); ++i) EXPECT_EQ(f64(t)[i], 1.0);
 }
 
-// ---------------------------------------------------------------------------
 // float64 mean backward scale is formed in double.
-// ---------------------------------------------------------------------------
-
 TEST(MeanBackwardPrecision, Float64ScaleIsExactDouble) {
     for (int64_t factor : {int64_t{3}, int64_t{6}, int64_t{7}, int64_t{1000}}) {
         Tensor t = full({factor}, 1.0, DType::Float64, Device{});
@@ -115,10 +109,7 @@ TEST(MeanBackwardPrecision, Float32ScaleUnchanged) {
     EXPECT_FLOAT_EQ(f32(t.grad())[0], 1.0f / 6.0f);
 }
 
-// ---------------------------------------------------------------------------
 // Tensor-Tensor sub and div.
-// ---------------------------------------------------------------------------
-
 TEST(SubDiv, SubForwardFloat32) {
     Tensor a = from_f32({3}, {5.0f, 2.0f, -1.0f});
     Tensor b = from_f32({3}, {1.0f, 4.0f, -3.0f});
@@ -220,10 +211,7 @@ TEST(SubDiv, DivByZeroPreservesFloatingSemantics) {
     EXPECT_TRUE(std::isnan(f32(c)[2]));
 }
 
-// ---------------------------------------------------------------------------
 // the scalar representation contract.
-// ---------------------------------------------------------------------------
-
 TEST(ScalarOps, ScalarLikeIsRank0AndUntracked) {
     Tensor ref = zeros({64, 64}, DType::Float32, Device{});
     ref.requires_grad_(true);
@@ -250,10 +238,7 @@ TEST(ScalarOps, ScalarLikeFollowsTensorDtypeNotPythonDouble) {
     EXPECT_EQ(f32(sf)[0], static_cast<float>(1.0 / 3.0));
 }
 
-// ---------------------------------------------------------------------------
 // scalar forward and backward.
-// ---------------------------------------------------------------------------
-
 TEST(ScalarOps, ForwardValues) {
     Tensor x = from_f32({3}, {1.0f, 2.0f, 4.0f});
     EXPECT_FLOAT_EQ(f32(scalar_add(x, 3.0))[0], 4.0f);
@@ -310,13 +295,10 @@ TEST(ScalarOps, ScalarConstantNeverReceivesGradient) {
     EXPECT_EQ(y.grad_fn()->inputs[0].impl().get(), x.impl().get());
 }
 
-// ---------------------------------------------------------------------------
 // mutation selectivity. Watch only what backward actually reads.
-// ---------------------------------------------------------------------------
-
 static void mutate(Tensor& t) {
     static_cast<float*>(t.data())[0] = 99.0f;
-    t.impl()->storage()->bump_version();
+    t.impl()->buffer()->bump_version();
 }
 
 TEST(ScalarVersioning, AddMulSubDivDoNotWatchTheInput) {
@@ -347,10 +329,7 @@ TEST(ScalarVersioning, ReverseDivisionDoesWatchTheInput) {
     EXPECT_THROW(sum(y).backward(), std::runtime_error);
 }
 
-// ---------------------------------------------------------------------------
 // scalar arithmetic follows normal grad mode.
-// ---------------------------------------------------------------------------
-
 TEST(ScalarOps, NoGradProducesNoGraph) {
     Tensor x = from_f32({2}, {1.0f, 2.0f});
     x.requires_grad_(true);
@@ -368,10 +347,7 @@ TEST(ScalarOps, UntrackedInputProducesUntrackedOutput) {
     EXPECT_FALSE(y.has_grad_fn());
 }
 
-// ---------------------------------------------------------------------------
 // unbroadcast is typed on the gradient's dtype (float64 broadcast backward).
-// ---------------------------------------------------------------------------
-
 TEST(BroadcastBackward, Float64GradientKeepsItsDtypeAndValues) {
     Tensor a = from_f64({1, 3}, {1.0, 2.0, 3.0});
     Tensor b = from_f64({2, 1}, {10.0, 20.0});

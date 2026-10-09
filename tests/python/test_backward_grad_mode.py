@@ -1,25 +1,6 @@
-"""Backward grad-mode structural safety.
-
-``Tensor::backward`` holds a single ``NoGradGuard`` for the whole traversal,
-so a gradient is always a plain, graph-free tensor.
-
-The guard is load-bearing, not defensive. Node backwards legitimately build
-gradients out of public differentiable ops applied to the inputs they hold --
-``MulNode`` does ``mul(grad, inputs[1])``, ``MatMulNode`` transposes and
-re-multiplies its operands -- and those inputs require grad by definition. Run
-with grad mode enabled, those calls attach nodes and the returned gradient
-carries a live graph::
-
-    x.grad.requires_grad  -> True
-    x.grad._has_grad_fn   -> True
-    x.grad.is_leaf        -> False
-
-on CPU **and** CUDA. A per-Node guard would leave the invariant depending on
-every future Node remembering it; one central guard makes it structural.
-
-The engine is strictly first-order. If ``create_graph`` is ever added, that
-central guard is the thing that has to become conditional on it.
-"""
+"""Backward keeps every gradient graph-free under one traversal-wide NoGradGuard."""
+from tests.support.source import REPO_ROOT
+from tests.support.capabilities import orthon_cuda_available
 import numpy as np
 import pytest
 
@@ -27,7 +8,7 @@ import orthon as ortho
 
 torch = pytest.importorskip("torch")
 
-CUDA = ortho.cuda_enabled()
+CUDA = orthon_cuda_available()
 DEVICES = ["cpu"] + (["cuda"] if CUDA else [])
 requires_cuda = pytest.mark.skipif(not CUDA, reason="CUDA not available")
 
@@ -71,14 +52,11 @@ def _plain(g):
             and g.is_leaf is True)
 
 
-# --------------------------------------------------------------------------
 # The families that actually regressed, pinned individually
-# --------------------------------------------------------------------------
-
 @pytest.mark.parametrize("dev", DEVICES)
 def test_mul_backward_produces_plain_gradients(dev):
     """Without the central guard this reports requires_grad=True and a
-    grad_fn on BOTH devices."""
+    grad_fn on both devices."""
     x = _d(X34, dev)
     y = _d(Y34, dev)
     x.requires_grad_(True)
@@ -118,10 +96,7 @@ def test_fused_linear_relu_backward_produces_plain_gradients(dev):
     assert _plain(b.grad)
 
 
-# --------------------------------------------------------------------------
 # Node-family sweep: the central invariant, not one test per Node
-# --------------------------------------------------------------------------
-
 FAMILIES = {
     "AddNode": ({"x": X34, "y": Y34},
                 lambda t, dv: ortho.sum(ortho.add(t["x"], t["y"]) * _d(UP34, dv))),
@@ -194,10 +169,7 @@ def test_embedding_backward_produces_plain_gradients(dev):
     assert _plain(w.grad)
 
 
-# --------------------------------------------------------------------------
 # Grad mode during backward, and caller-state restoration
-# --------------------------------------------------------------------------
-
 def _observe_during_backward(dev, disable_caller_grad=False):
     """Return (observed_inside_hook, grad_mode_after)."""
     observed = []
@@ -270,10 +242,7 @@ def test_forward_still_builds_a_graph_after_backward(dev):
     assert ortho.mul(x, _d(Y34, dev))._has_grad_fn is True
 
 
-# --------------------------------------------------------------------------
 # Exception unwinding
-# --------------------------------------------------------------------------
-
 class _HookBoom(RuntimeError):
     pass
 
@@ -337,10 +306,7 @@ def test_native_backward_failure_restores_caller_grad_mode(dev):
     assert ortho.is_grad_enabled() is True
 
 
-# --------------------------------------------------------------------------
 # retain_graph and repeated backward
-# --------------------------------------------------------------------------
-
 @pytest.mark.parametrize("dev", DEVICES)
 def test_retain_graph_allows_a_second_backward_and_accumulates(dev):
     x = _d(X34, dev)
@@ -394,10 +360,7 @@ def test_repeated_backward_across_separate_graphs_accumulates(dev):
     assert _plain(x.grad)
 
 
-# --------------------------------------------------------------------------
 # Numerical parity is unaffected by the guard
-# --------------------------------------------------------------------------
-
 @pytest.mark.parametrize("dev", DEVICES)
 def test_mul_gradient_values_match_torch(dev):
     x = _d(X34, dev)
@@ -440,31 +403,21 @@ def test_gradient_dtype_and_exact_device_preserved(dev):
     assert x.grad.is_contiguous is True
 
 
-# --------------------------------------------------------------------------
 # Structural placement, and the deliberately-kept local guards
-# --------------------------------------------------------------------------
-
-def _tensor_cpp():
-    import os
-    p = os.path.join(os.path.dirname(__file__), "..", "..", "src", "core", "tensor.cpp")
-    with open(p, encoding="utf-8") as f:
-        return f.read()
-
-
 def test_backward_holds_a_single_central_nograd_guard():
     """Source-level: RAII, once, in the engine -- not paired setters and not
     per-Node."""
-    src = _tensor_cpp()
-    body = src[src.index("void Tensor::backward(bool retain_graph)"):]
+    from pathlib import Path
+    from tests.support.source import function
+    src = (REPO_ROOT / "src/autograd/engine.cpp").read_text()
+    body = function(src, "AutogradEngine::backward")
     assert body.count("NoGradGuard") == 1
-    # The guard must precede the traversal it protects.
-    assert body.index("NoGradGuard") < body.index("grad_fn()->backward(")
-    # RAII only: no manual pairing anywhere in the engine.
+    assert body.index("NoGradGuard") < body.index("task.evaluate(")
     assert "set_grad_enabled(" not in body
 
 
 def test_softmax_and_cross_entropy_local_guards_are_retained():
-    """The per-Node guards are deliberately KEPT.
+    """The per-Node guards are deliberately kept.
 
     They are redundant during an ordinary Tensor::backward, but they still
     protect these Node backwards if ever invoked directly.
@@ -488,10 +441,7 @@ def test_engine_exposes_no_higher_order_autograd_api():
         loss.backward(create_graph=True)
 
 
-# --------------------------------------------------------------------------
 # DDP post-accumulate hooks
-# --------------------------------------------------------------------------
-
 def _ddp_hook_worker(rank, _unused):
     """Runs in a spawned worker with distributed already initialised.
 

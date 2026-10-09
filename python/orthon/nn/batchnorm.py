@@ -55,14 +55,10 @@ class _BatchNorm(Module):
         return count
 
     def _detached_stat(self, tensor, buffer):
-        """Independent, graph-free copy of a statistic, matching a buffer.
+        """Copy a statistic to independent buffer-shaped state under no_grad.
 
-        The detachment is EXPLICIT: Tensor.to() and floating cast() are
-        differentiable in normal grad mode, so this snapshot runs under
-        no_grad by intent rather than by side effect. to() performs a physical
-        copy even for a same-device move, so the result is independent of the
-        batch graph with no host round-trip.
-        """
+        Same-device to() still copies; explicit detachment prevents a batch graph
+        from surviving in running statistics."""
         with ortho.no_grad():
             out = tensor.reshape([self.num_features]).to(buffer.device)
             if out.dtype != buffer.dtype:

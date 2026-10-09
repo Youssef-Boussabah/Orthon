@@ -1,14 +1,5 @@
-"""Autograd correctness for unary negation.
-
-neg() attaches an autograd node, so a graph containing a negation stays
-connected to earlier operations. Producing correct values without a node is
-not a wrong-looking number: backward raises "backward(): tensor does not
-require grad", or, in a branched graph, simply drops the negated term's
-contribution.
-
-These tests therefore assert gradient VALUES against PyTorch and against closed
--form derivatives, not merely that a gradient exists.
-"""
+"""Unary negation gradients, composition and value-insensitive mutation behavior."""
+from tests.support.capabilities import orthon_cuda_available
 import numpy as np
 import pytest
 
@@ -16,7 +7,7 @@ import orthon as ortho
 
 torch = pytest.importorskip("torch")
 
-CUDA = ortho.cuda_enabled()
+CUDA = orthon_cuda_available()
 requires_cuda = pytest.mark.skipif(not CUDA, reason="CUDA not available")
 requires_torch_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -49,8 +40,7 @@ def _npy(t):
     return np.array(t.tolist(), dtype=np.float64)
 
 
-# ---- every entry point is graph-connected ----
-
+# every entry point is graph-connected
 @pytest.mark.parametrize("name,fn", ENTRY_POINTS, ids=[n for n, _ in ENTRY_POINTS])
 def test_entry_point_attaches_graph(name, fn):
     x = _t(X, rg=True)
@@ -89,8 +79,7 @@ def test_no_graph_when_input_does_not_require_grad():
     assert y._has_grad_fn is False
 
 
-# ---- grad mode ----
-
+# grad mode
 def test_no_grad_suppresses_graph():
     x = _t(X, rg=True)
     with ortho.no_grad():
@@ -124,8 +113,7 @@ def test_grad_mode_restored_after_no_grad_block():
     assert ortho.neg(x)._has_grad_fn is True
 
 
-# ---- CPU parity ----
-
+# CPU parity
 def _parity(device="cpu", dtype="float32", tdtype=torch.float32, tol=1e-5,
             compose=False):
     x = _t(X, device, dtype, rg=True)
@@ -191,8 +179,7 @@ def test_neg_after_another_op_parity():
         xt.grad.numpy().ravel().astype(np.float64), abs=1e-4)
 
 
-# ---- branched accumulation and double negation ----
-
+# branched accumulation and double negation
 def test_branched_accumulation():
     """a = -x ; b = x*x ; loss = sum(a + b) -> grad = -1 + 2x."""
     x = _t(X, rg=True)
@@ -237,8 +224,7 @@ def test_neg_inside_a_deeper_chain():
         xt.grad.numpy().ravel().astype(np.float64), abs=1e-5)
 
 
-# ---- CUDA parity ----
-
+# CUDA parity
 @requires_cuda
 @requires_torch_cuda
 def test_cuda_float32_direct_parity():

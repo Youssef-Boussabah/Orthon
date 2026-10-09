@@ -1,4 +1,5 @@
 #include <orthon/core/shape.h>
+#include <orthon/core/layout.h>
 #include <stdexcept>
 
 namespace orthon {
@@ -12,12 +13,7 @@ void validate_shape(const std::vector<int64_t>& shape) {
 }
 
 int64_t numel(const std::vector<int64_t>& shape) {
-    validate_shape(shape);
-    int64_t n = 1;
-    for (int64_t d : shape) {
-        n *= d;
-    }
-    return n;
+    return Layout::shape_numel(shape);
 }
 
 }  // namespace orthon

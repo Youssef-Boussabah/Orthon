@@ -1,13 +1,15 @@
 """Benchmark Orthon FP32 training against explicit FP16 AMP training on CUDA.
 
 The benchmark runs FP32 and AMP in the same process on the same synthetic
-workload, then reports speedup only from those paired measurements.  AMP here
+workload, then reports separate continuous-region observations without a statistical winner.  AMP here
 means explicit FP16 model/input tensors plus MixedPrecisionOptimizer and
 GradScaler; this benchmark intentionally does not use autocast.
 """
 
+from benchmarks._support.training import measured, configure, options, run as run_measurement
+from benchmarks._support.environment import synchronizer, cuda_available
+
 import argparse
-import time
 
 import orthon as ortho
 from orthon.amp import GradScaler, MixedPrecisionOptimizer
@@ -159,8 +161,7 @@ def loss_fn(model, x):
 
 
 def sync(device):
-    if device == "cuda" and hasattr(ortho, "cuda_synchronize"):
-        ortho.cuda_synchronize()
+    synchronizer(device, "orthon")()
 
 
 def scalar_float(tensor):
@@ -187,14 +188,14 @@ def run_fp32(args, config):
     sync(args.device)
 
     last_loss = None
-    start = time.perf_counter()
-    for _ in range(config["steps"]):
-        optimizer.zero_grad()
-        last_loss = loss_fn(model, x)
-        last_loss.backward()
-        optimizer.step()
-    sync(args.device)
-    elapsed = time.perf_counter() - start
+    with measured("bench_amp_vs_fp32:start:run_fp32", lambda: sync(args.device), calls=config['steps'], device=args.device, implementation="orthon", dtype="float32", config=dict(vars(args), **config)) as _region_start:
+        for _ in range(config["steps"]):
+            optimizer.zero_grad()
+            last_loss = loss_fn(model, x)
+            last_loss.backward()
+            optimizer.step()
+        sync(args.device)
+    elapsed = _region_start["seconds"]
     return {
         "ms_per_step": elapsed * 1000.0 / config["steps"],
         "samples_per_sec": config["batch_size"] * config["steps"] / elapsed,
@@ -224,15 +225,15 @@ def run_amp(args, config):
     sync(args.device)
 
     last_loss = None
-    start = time.perf_counter()
-    for _ in range(config["steps"]):
-        optimizer.zero_grad()
-        last_loss = loss_fn(model, x)
-        scaler.scale(last_loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-    sync(args.device)
-    elapsed = time.perf_counter() - start
+    with measured("bench_amp_vs_fp32:start:run_amp", lambda: sync(args.device), calls=config['steps'], device=args.device, implementation="orthon", dtype="float16", config=dict(vars(args), **config)) as _region_start:
+        for _ in range(config["steps"]):
+            optimizer.zero_grad()
+            last_loss = loss_fn(model, x)
+            scaler.scale(last_loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        sync(args.device)
+    elapsed = _region_start["seconds"]
     return {
         "ms_per_step": elapsed * 1000.0 / config["steps"],
         "samples_per_sec": config["batch_size"] * config["steps"] / elapsed,
@@ -266,7 +267,8 @@ def parse_args():
     parser.add_argument("--input-value", type=float, default=0.01)
     parser.add_argument("--init-scale", type=float, default=128.0)
     parser.add_argument("--growth-interval", type=int, default=2000)
-    args = parser.parse_args()
+    options(parser)
+    args = configure(parser.parse_args())
 
     config = resolve_config(args)
     for key in ("steps", "batch_size", "input_dim", "hidden_size", "layers"):
@@ -312,7 +314,7 @@ def print_summary(args, config, fp32, amp):
     print(f"amp_ms_per_step: {amp['ms_per_step']:.3f}")
     print(f"fp32_samples_per_sec: {fp32['samples_per_sec']:.2f}")
     print(f"amp_samples_per_sec: {amp['samples_per_sec']:.2f}")
-    print(f"speedup_vs_fp32: {speedup:.3f}")
+    print(f"unverified_region_ratio: {speedup:.3f}")
     print(f"fp32_final_loss: {fp32['final_loss']:.6f}")
     print(f"amp_final_loss: {amp['final_loss']:.6f}")
     print(f"scaler_initial_scale: {args.init_scale:.1f}")
@@ -336,7 +338,7 @@ def print_summary(args, config, fp32, amp):
         f"amp_ms_per_step={amp['ms_per_step']:.3f},"
         f"fp32_samples_per_sec={fp32['samples_per_sec']:.2f},"
         f"amp_samples_per_sec={amp['samples_per_sec']:.2f},"
-        f"speedup_vs_fp32={speedup:.3f},"
+        f"unverified_region_ratio={speedup:.3f},"
         f"fp32_final_loss={fp32['final_loss']:.6f},"
         f"amp_final_loss={amp['final_loss']:.6f},"
         f"scaler_initial_scale={args.init_scale:.1f},"
@@ -347,7 +349,7 @@ def print_summary(args, config, fp32, amp):
 
 def main():
     args, config = parse_args()
-    if not ortho.cuda_enabled():
+    if not cuda_available("cuda:0"):
         print("benchmark_name=amp_vs_fp32,status=skipped,reason=cuda_unavailable")
         return
 
@@ -357,4 +359,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run_measurement(main, "bench_amp_vs_fp32")

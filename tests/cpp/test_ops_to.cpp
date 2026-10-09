@@ -1,8 +1,8 @@
 #include <gtest/gtest.h>
 #include <orthon/core/tensor.h>
 #include <orthon/device/device.h>
-#include <orthon/ops/cpu/fill_ops.h>
-#include <orthon/ops/cpu/shape_ops.h>
+#include <orthon/ops/fill_ops.h>
+#include <orthon/ops/shape_ops.h>
 #include <stdexcept>
 
 #ifdef WITH_CUDA
@@ -68,7 +68,7 @@ TEST(TensorTo, PreservesShape) {
     EXPECT_EQ(c.shape(), expected);
 }
 
-// ---- Cross-device transfer, per build configuration ----
+// Cross-device transfer, per build configuration
 //
 // The expectation depends on the build, so the tests are split rather than
 // written once. In a CPU-only build Tensor::to's cross-device branch is

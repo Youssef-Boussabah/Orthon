@@ -8,24 +8,16 @@ from . import _state
 from ._env import apply_env_defaults, rank_config_from_env
 from .local_backend import spawn
 from .work import Work
+from ._process_group import _ProcessGroup
 
 
 def init_process_group(backend=None, **kwargs):
-    """Initialize the correctness-first DDP-lite process group.
+    """Initialize a single-node process group using local or NCCL transport.
 
-    Supported backends are:
-    - local: CPU/local multiprocessing collectives for correctness tests.
-    - nccl: single-node GPU-resident collectives for contiguous CUDA
-      float32/float16/bfloat16 tensors.
-
-    Rank settings may be passed explicitly or inferred from RANK, WORLD_SIZE,
-    LOCAL_RANK, LOCAL_WORLD_SIZE, and ORTHON_DISTRIBUTED_BACKEND.
-
-    DDP synchronizes gradients automatically by default (sync_grads=True
-    registers post-accumulate hooks that all-reduce after backward()).
-    Construct DDP with sync_grads=False and call
-    ddp_model.all_reduce_gradients() for explicit manual synchronization.
-    """
+    Rank settings come from arguments or launcher environment variables.
+    NCCL supports contiguous CUDA Float32/Float16/BFloat16 tensors.
+    DDP reduces gradients before backward returns; sync_grads=False selects
+    explicit all_reduce_gradients() calls. See docs/distributed.md."""
     if _state.is_initialized():
         raise RuntimeError(
             "distributed process group is already initialized; "
@@ -34,7 +26,7 @@ def init_process_group(backend=None, **kwargs):
     backend, kwargs = apply_env_defaults(backend, kwargs)
     factory = get_backend_factory(backend)
     instance = factory(**kwargs)
-    _state.set_active(instance)
+    _state.set_active(_ProcessGroup(instance))
     return instance
 
 

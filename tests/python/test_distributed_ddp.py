@@ -7,6 +7,7 @@ import orthon as ortho
 import orthon.distributed as ddist
 from orthon.distributed import DistributedDataParallel as DDP
 from orthon.distributed.local_backend import create_store
+from orthon.distributed._reducer import _Reducer
 from orthon.nn import Linear
 
 
@@ -96,7 +97,7 @@ def _ddp_worker(rank, world_size, store, case_name, results, failures):
             loss.backward()
             results.put((rank, {
                 "averaged_grad": _gradient_values(model),
-                "bucket_count": len(ddp_model._buckets),
+                "bucket_count": ddp_model._reducer.diagnostics()["buckets"],
             }))
         elif case_name == "bucket_overlap_grad_average":
             model = Linear(2, 1)
@@ -111,18 +112,18 @@ def _ddp_worker(rank, world_size, store, case_name, results, failures):
             x = _filled_input(rank + 1, [1, 2])
             loss = ortho.sum(ddp_model(x))
             loss.backward()
-            pending_after_backward = len(ddp_model._outstanding_bucket_work)
-            launch_count = ddp_model._overlap_bucket_launch_count
+            pending_after_backward = ddp_model._reducer.diagnostics()["outstanding"]
+            launch_count = ddp_model._reducer.diagnostics()["async_launches"]
             ddp_model.wait_for_gradient_sync()
             first_wait_grad = _gradient_values(model)
             ddp_model.wait_for_gradient_sync()
             results.put((rank, {
                 "averaged_grad": _gradient_values(model),
                 "first_wait_grad": first_wait_grad,
-                "bucket_count": len(ddp_model._buckets),
+                "bucket_count": ddp_model._reducer.diagnostics()["buckets"],
                 "launch_count": launch_count,
                 "pending_after_backward": pending_after_backward,
-                "pending_after_wait": len(ddp_model._outstanding_bucket_work),
+                "pending_after_wait": ddp_model._reducer.diagnostics()["outstanding"],
             }))
         elif case_name == "bucket_overlap_manual_flush":
             model = Linear(2, 1)
@@ -137,14 +138,14 @@ def _ddp_worker(rank, world_size, store, case_name, results, failures):
             x = _filled_input(rank + 1, [1, 2])
             loss = ortho.sum(ddp_model(x))
             loss.backward()
-            pending_after_backward = len(ddp_model._outstanding_bucket_work)
-            launch_count = ddp_model._overlap_bucket_launch_count
+            pending_after_backward = ddp_model._reducer.diagnostics()["outstanding"]
+            launch_count = ddp_model._reducer.diagnostics()["async_launches"]
             ddp_model.all_reduce_gradients()
             results.put((rank, {
                 "averaged_grad": _gradient_values(model),
                 "launch_count": launch_count,
                 "pending_after_backward": pending_after_backward,
-                "pending_after_manual_sync": len(ddp_model._outstanding_bucket_work),
+                "pending_after_manual_sync": ddp_model._reducer.diagnostics()["outstanding"],
             }))
         elif case_name == "bucket_overlap_zero_grad_is_safe_after_backward":
             model = Linear(2, 1)
@@ -159,7 +160,7 @@ def _ddp_worker(rank, world_size, store, case_name, results, failures):
             x = _filled_input(rank + 1, [1, 2])
             loss = ortho.sum(ddp_model(x))
             loss.backward()
-            pending_after_backward = len(ddp_model._outstanding_bucket_work)
+            pending_after_backward = ddp_model._reducer.diagnostics()["outstanding"]
             ddp_model.zero_grad()
             results.put((rank, {
                 "pending_after_backward": pending_after_backward,
@@ -335,4 +336,4 @@ def test_tensor_post_accumulate_grad_hook_fires_once_per_backward():
 def test_ddp_rejects_low_precision_gradient_sync_dtype(dtype):
     grad = ortho.cast(ortho.ones([2]), dtype)
     with pytest.raises(RuntimeError, match="only supports float32/float64"):
-        DDP._validate_gradient_sync_dtype(None, grad)
+        _Reducer.validate_gradient(grad)
